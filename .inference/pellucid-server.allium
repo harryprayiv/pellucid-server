@@ -1,0 +1,1921 @@
+-- allium: 3
+--
+-- pellucid-server: the server Pellucid will need once it stops borrowing
+-- Pixelfed's. This file specifies behaviour: what an account, a post, a
+-- follow, a token, a report and a federated delivery are and how each
+-- changes. The rules name no language, no database and no framework;
+-- section IMPLEMENTATION STATUS says what the code in this repository is
+-- written in, which rules it carries out and what it leaves undone.
+--
+-- RELATION TO OTHER SPECS. pellucid.allium, in the .inference directory
+-- of the pellucid repository, is the client. This file lived beside it
+-- until 2026-11-10 and moved here with the first server code. The
+-- client's contract PixelfedApi and contract Pagers list the
+-- routes it calls; surface ClientApi here is the same set of operations
+-- seen from the other side. Where this server deliberately differs from
+-- Pixelfed, the difference is a decision below and the client spec's
+-- KnownIssue that it closes is named.
+--
+-- THIS FILE IS CHECKED. `allium check .inference/pellucid-server.allium`
+-- (allium 3.6.1) reports no errors and no warnings; one informational
+-- note stays, that external entity RemoteServer has no governing spec,
+-- which is true. Every lifecycle is a
+-- field named status with a transition graph, which is the form the
+-- checker's state analysis covers: it rejects a rule that makes a
+-- transition the graph does not declare, a status no rule assigns and a
+-- status no rule leaves.
+--
+-- STATUS OF THE DECISIONS. S1 to S4 restate what was asked for: a server
+-- that does what Pixelfed's does, that existing clients and existing
+-- instances can talk to, and that is less authoritarian. S5 to S16 are
+-- proposals written to make "less authoritarian" concrete enough to
+-- check. They are the author of this file's reading of that phrase, not
+-- instructions received, and each one that is wrong should be struck.
+-- S3's choice of language and S17 to S19 were taken by the same author on
+-- 2026-11-10, while writing the first code, and are proposals in the same
+-- sense: the code follows them, and striking one means changing code.
+--
+--   S1. PROTOCOL COMPATIBLE. The client API is the one pixelfed-rn and
+--       Pellucid already speak (the Mastodon-shaped API with Pixelfed's
+--       additions), so both work against this server unchanged. Between
+--       servers it speaks ActivityPub with HTTP Signatures, so existing
+--       Pixelfed and Mastodon instances federate with it.
+--   S2. FEATURE PARITY FIRST. Accounts, photo and video posts with
+--       albums, comments, likes, shares, bookmarks, follows with locked
+--       accounts, blocks, mutes, hashtags, notifications, direct
+--       messages, reports and moderation, search and discovery. Stories,
+--       collections, groups and the import tools are not specified yet.
+--   S3. NOT PHP; HASKELL. The server is written in Haskell on WAI and
+--       Warp, with PostgreSQL, laid out as open-slop is. The language was
+--       an open question in this file until 2026-11-10 and was settled
+--       from Harry's stated preference for Haskell, not from an
+--       instruction for this project. The rules below still name no
+--       language, so striking this changes no rule.
+--   S4. ONE SPEC PER SIDE. The client and the server each have a spec and
+--       neither assumes how the other is built.
+--
+--   S5. MODERATION IS SEEN BY THE PERSON IT TOUCHES. Every action a
+--       moderator takes against an account or a post creates a notice to
+--       that account naming the action, the rule relied on and the
+--       moderator's reason. There is no action without a notice: no
+--       silent limiting, no hiding from feeds without telling the author.
+--   S6. EVERY ACTION CAN BE APPEALED, ONCE, TO SOMEONE ELSE. An appeal is
+--       decided by a moderator other than the one who acted. Where an
+--       instance has one moderator the appeal is still recorded and
+--       answered; the notice says who will read it.
+--   S7. THE INSTANCE PUBLISHES WHAT ITS MODERATORS DO. Counts of actions
+--       by kind and by month, and the list of blocked domains with the
+--       stated reason, are public. No account is named in either.
+--   S8. THE ACCOUNT BELONGS TO THE PERSON. An export of posts, media,
+--       follows, blocks and bookmarks can be requested at any time and
+--       does not depend on the account's standing: a suspended account
+--       can still export and still move. Followers move with the account
+--       (ActivityPub Move).
+--   S9. LEAVING IS COMPLETE. A deletion the person asks for removes posts,
+--       media, likes, follows and messages after a grace period in which
+--       it can be withdrawn, and federates the deletion.
+--   S10. FEEDS ARE CHRONOLOGICAL. The home timeline is the person's own
+--        posts and the posts of the accounts and hashtags followed,
+--        newest first, with nothing inserted and nothing reordered. Trending lists are computed from
+--        public counts by a published rule and appear only where asked
+--        for.
+--   S11. A CLIENT CAN GIVE ITS TOKEN BACK. Public clients (PKCE, no
+--        secret) are first class; a token can be revoked by the client
+--        that holds it; a person can list and revoke every session.
+--        Closes the client's KnownIssue no_token_revoke and its question
+--        about the secret in the session file.
+--   S12. ONE WAY TO PAGE. Every list pages by an opaque cursor in a Link
+--        header whose rel="next" leads further into the list, for
+--        everyone allowed to see the list. Closes the client's
+--        likes_list_is_one_page_for_others and tag_feed_extra_request and
+--        retires three of the four schemes its contract Pagers handles.
+--   S13. UNUSED UPLOADS CAN BE TAKEN BACK. An upload not yet attached to a
+--        post can be deleted by its owner, and is collected after a fixed
+--        time otherwise. Closes the client's orphan_uploads.
+--   S14. EDITS NAME WHAT THEY CHANGE. An edit changes only the fields it
+--        sends; attachments are removed only by naming them. Pixelfed
+--        deletes every attachment an edit's list leaves out, which is the
+--        reason for the client's D30.
+--   S15. OPERATORS ARE BOUND TOO. Direct messages are not readable
+--        through any moderation surface unless a participant reports a
+--        message, and then only the reported message and its neighbours.
+--        Every operator and moderator action is written to an audit log
+--        other moderators can read.
+--   S16. NO TELEMETRY. The server sends nothing about its people to
+--        anyone but the servers their posts are addressed to.
+--   S17. THE SERVER GIVES ITS OWN NAME. nodeinfo's software.name is
+--        pellucid. A server that is not Pixelfed does not say it is, and
+--        the counts that crawlers build from nodeinfo stay true. The
+--        cost falls on S1: pixelfed-rn refuses, in its own code, any
+--        server whose nodeinfo name is not pixelfed, so it cannot sign
+--        in here unchanged; and the Pellucid client's check_software
+--        refuses this server until it accepts the name (KnownIssue
+--        client_refuses_this_server, recorded in both specs). The client
+--        API itself stays compatible.
+--   S18. A NEW SCHEMA. The database is this server's own, not Pixelfed's.
+--        An existing Pixelfed instance would come across through an
+--        importer, which is not written.
+--   S19. WHAT IS STORED IS SCRUBBED, WITHOUT DECODING. An upload is walked
+--        piece by piece, and every piece that is not needed to draw the
+--        picture is left out before anything is written: EXIF with its
+--        position and device, the embedded thumbnail, XMP, IPTC,
+--        comments, and whatever follows the end of the image. A JPEG's
+--        orientation is kept, alone. No image decoder runs on bytes a
+--        stranger sent. A type that cannot be scrubbed this way is
+--        refused. Thumbnails will need a decoder and are an open question
+--        below.
+--
+-- IMPLEMENTATION STATUS at 2026-11-11: the first batch of code, of
+-- 2026-11-10, and the deployment module that followed it. The code is in
+-- this repository: Haskell (GHC2021), WAI and Warp, PostgreSQL through
+-- postgresql-simple. The decision of each rule is a pure function under
+-- src/Pellucid/Domain, named for the rule it carries out; the store
+-- carries a decision out in one transaction; the HTTP layer is a route
+-- table held as a value.
+--
+--   BUILT      Rules ClientRegistered, AuthorizationGranted, TokenIssued,
+--              TokenRevoked, MediaTakenBack, MediaAttached, MediaReleased,
+--              PostPublished, PostWithdrawn, FollowedOpenAccount,
+--              FollowRequestedOfLockedAccount and Unfollowed. Rules
+--              CodeExpired and TokenExpired as a check made when a code
+--              or a token is used. Invariants OneFollowPerPair,
+--              NobodyFollowsThemselves and PublicClientsHoldNoSecret as
+--              database constraints; PublicClientsAlwaysUsePkce,
+--              AttachedMediaBelongsToItsPostsAuthor and the first half of
+--              PostsHaveMediaAndCommentsNeedNone in the rules' decisions.
+--              Contract ClientApiCompat's invariants SameEntityEverywhere
+--              and ErrorsSayWhy for the routes that exist, and
+--              OneWayToPage with max_id translated to a cursor; min_id and
+--              page are accepted and ignored.
+--              The reading rules can_see, home timeline and public
+--              timeline, without blocks, mutes, hashtags and limit_reach,
+--              none of which exists yet. Surface SignIn's guarantee
+--              SecretsAreNeverReturnedTwice. Decisions S12 and S13 for
+--              what exists; of S11, public clients and a token given back
+--              by its holder, not the list of a person's sessions; and
+--              S17 to S19.
+--   PARTIAL    Rules MediaReceived, MediaProcessingStarted and
+--              MediaProcessed run inside the upload request: the file is
+--              scrubbed, then written, then its row is written once, as
+--              ready. A file that cannot be scrubbed is refused and gets
+--              no row, so status unusable is never reached. JPEG and PNG
+--              are accepted; GIF, WebP and MP4 are in config's list and
+--              are refused until each has a scrubber (KnownIssue
+--              three_types_refused). Rule AccountRegistered exists for an
+--              operator only, as a command: open_registration is false
+--              and there is no route for it. Rules FollowRequestAccepted
+--              and FollowRequestRejected have no route, and no route can
+--              lock an account, so a follow request can be made only by
+--              a test of the decision. The notifications and the
+--              FederationQueued that several built rules also ensure are
+--              not produced.
+--   NOT BUILT  Everything else: the remaining account rules,
+--              UnattachedMediaCollected, comments, edits, likes, shares,
+--              bookmarks, blocks, mutes, hashtags, notifications, direct
+--              messages, reports, moderation, appeals, federation,
+--              export, and surfaces ModerationDesk, PublicRecord,
+--              Federation and Workers. A request to publish a comment is
+--              answered 501 and is not published as something else.
+--
+--   ROUTES     GET /.well-known/nodeinfo, /api/nodeinfo/2.0.json,
+--              /api/v1/instance, /api/v1.1/compose/settings.
+--              POST /api/v1/apps. GET and POST /oauth/authorize.
+--              POST /oauth/token, /oauth/revoke.
+--              GET /api/v1/accounts/verify_credentials, /relationships,
+--              /{id}, /{id}/statuses.
+--              POST /api/v1/accounts/{id}/follow, /unfollow.
+--              POST /api/v2/media, /api/v1/media.
+--              PUT and DELETE /api/v1/media/{id}. GET /media/{file}.
+--              POST /api/v1/statuses. GET and DELETE
+--              /api/v1/statuses/{id}. GET /api/v1/statuses/{id}/context.
+--              GET /api/v1/timelines/home, /public.
+--
+--   CHECKED    74 tests: the rules' decisions as unit and property tests;
+--              the scrubber against files built segment by segment; and
+--              one session end to end through the WAI application
+--              against a PostgreSQL started for the run (register, sign
+--              in with PKCE, token, replay, upload, post, both timelines
+--              with paging, follow, the reading rules, delete, revoke).
+--              Where the work was written: GHC 9.4.7 with the library
+--              versions nixpkgs' set provides, no warnings; and the
+--              scrubber's output for a real baseline JPEG, a progressive
+--              JPEG and a PNG, which an independent decoder read back to
+--              the same pixels with no metadata left but the orientation.
+--              On winsmuth, 2026-11-11: nix develop and the gate passed
+--              with the flake's GHC 9.6.7, no warnings, all 74 tests.
+--              The same day, where the work is written, every answer of a
+--              two-account session against the running server
+--              (registration, token, account, upload, post, the
+--              timelines, relationships, compose settings, context) was
+--              read by the client's own PureScript decoders and by its
+--              Rust core's structs, with none refused.
+--
+--   DEPLOY     nix/module.nix, the flake's nixosModules.default:
+--              services.pellucid-server.{enable, package, domain, title,
+--              port, acme.{email, dnsProvider, environmentFile},
+--              rateLimit.{perMinute, burst}, openFirewall}. The service
+--              runs as its own user, listens on loopback, may talk to
+--              this machine only, and reaches PostgreSQL over its socket
+--              with no password. nginx terminates TLS with a certificate
+--              by DNS-01 and limits, per address, requests to the sign-in
+--              page and to client registration. The module was evaluated
+--              for a whole machine against the locked nixpkgs with no
+--              failed assertion and no warning. It has never run
+--              (KnownIssue module_never_run).
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- Another server in the fediverse, as its actor documents and signed
+-- requests describe it. Governed by ActivityPub and by that server.
+external entity RemoteServer {
+    domain: String
+    shared_inbox: String?
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value Bytes {}
+
+-- RFC 7636, as the server sees it: the challenge arrives with the
+-- authorization request, the verifier with the token request.
+value PkceChallenge {
+    challenge: String
+    method: String
+}
+
+-- A rule of the instance, as its about page publishes it.
+value InstanceRule {
+    number: Integer
+    text: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- The client API, as pellucid.allium's PixelfedApi and Pagers call it.
+-- One operation per group of routes; the routes themselves are the
+-- client spec's.
+contract ClientApiCompat {
+    timelines: (viewer: Account, cursor: String) -> Bytes
+    statuses: (viewer: Account, post: Post) -> Bytes
+    accounts: (viewer: Account, account: Account) -> Bytes
+    notifications: (viewer: Account, cursor: String) -> Bytes
+    search: (viewer: Account, query: String) -> Bytes
+    media: (viewer: Account, upload: Bytes) -> Bytes
+    direct: (viewer: Account, other: Account) -> Bytes
+    reports: (viewer: Account, reason: ReportReason) -> Bytes
+
+    @invariant SameEntityEverywhere
+        -- Every route that returns a post returns the same entity. The
+        -- _pe flag is accepted and ignored: there is no second, stripped
+        -- form to fall back to.
+
+    @invariant OneWayToPage
+        -- S12. A list response carries Link rel="next" while more exists
+        -- and nothing otherwise; the cursor is opaque and is the only
+        -- pagination parameter. max_id, min_id and page are accepted for
+        -- old clients and translated.
+
+    @invariant ErrorsSayWhy
+        -- A refusal is a status code and a JSON body with error and
+        -- error_code. A validation failure names the field and the limit.
+
+    @guidance
+        -- CORS: the API allows any origin for token-authenticated
+        -- requests, so a browser client is possible. Pixelfed's default
+        -- allows none, which is why Pellucid's requests come from Rust.
+}
+
+-- Server to server.
+contract ActivityPub {
+    deliver: (activity: Bytes, inbox: String) -> Boolean
+    receive: (activity: Bytes, signature: String) -> Boolean
+    fetch_actor: (uri: String) -> Bytes
+
+    @invariant SignedBothWays
+        -- Every delivery is signed with the sending actor's key and every
+        -- inbound activity is verified against the key its actor
+        -- publishes before it changes anything.
+
+    @invariant AddressedOnly
+        -- A post is delivered to the inboxes of its audience and nowhere
+        -- else: followers for a followers-only post, the named recipients
+        -- for a direct one (S16).
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum Visibility { public | unlisted | followers_only | direct }
+
+enum ClientKind { public_client | confidential_client }
+
+enum NotificationKind {
+    followed | follow_requested | mentioned | shared | liked | commented
+    | tagged | message_received | moderation_notice
+}
+
+enum ReportReason {
+    spam | sensitive_content | abusive | underage | violence
+    | copyright | impersonation | scam | terrorism
+}
+
+-- What a moderator can do. Ordered from least to most severe.
+enum ActionKind {
+    warn | mark_sensitive | remove_post | limit_reach | suspend_account
+}
+
+enum ActivityKind {
+    create | update | delete | follow | accept | reject | undo
+    | like | announce | block | move | flag
+}
+
+enum IssueStatus { open | closed }
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A person's presence on this server, or a remote actor known to it.
+entity Account {
+    username: String
+    -- Absent for an account that lives here.
+    home: RemoteServer?
+    display_name: String
+    note: String
+    locked: Boolean
+    is_moderator: Boolean
+    status: active | suspended | leaving | departed
+    moved_to: Account?
+    leaving_since: Timestamp when status = leaving
+
+    posts: Post with author = this
+    followers: Follow with target = this
+    following: Follow with follower = this
+    blocks: Block with blocker = this
+    tokens: AccessToken with account = this
+    notices: ModerationAction with subject = this
+
+    transitions status {
+        active -> suspended
+        suspended -> active
+        active -> leaving
+        suspended -> leaving
+        leaving -> active
+        leaving -> departed
+        terminal: departed
+    }
+
+    is_local: home = null
+    accepted_followers: followers where status = following
+}
+
+entity OAuthClient {
+    name: String
+    kind: ClientKind
+    redirect_uris: List<String>
+    -- What the client may be granted. A consent can narrow it and
+    -- cannot widen it.
+    scopes: List<String>
+    secret_hash: String?
+    codes: AuthorizationCode with client = this
+}
+
+entity AuthorizationCode {
+    client: OAuthClient
+    account: Account
+    redirect_uri: String
+    scopes: List<String>
+    pkce: PkceChallenge?
+    issued_at: Timestamp
+    status: issued | redeemed | stale
+
+    transitions status {
+        issued -> redeemed
+        issued -> stale
+        terminal: redeemed, stale
+    }
+}
+
+entity AccessToken {
+    client: OAuthClient
+    account: Account
+    scopes: List<String>
+    issued_at: Timestamp
+    status: valid | revoked | lapsed
+
+    transitions status {
+        valid -> revoked
+        valid -> lapsed
+        terminal: revoked, lapsed
+    }
+}
+
+entity Media {
+    owner: Account
+    post: Post?
+    mime: String
+    size_bytes: Integer
+    alt_text: String
+    uploaded_at: Timestamp
+    status: received | processing | ready | attached | unusable | purged
+
+    transitions status {
+        received -> processing
+        processing -> ready
+        processing -> unusable
+        ready -> attached
+        ready -> purged
+        unusable -> purged
+        attached -> purged
+        terminal: purged
+    }
+}
+
+entity Post {
+    author: Account
+    caption: String
+    visibility: Visibility
+    sensitive: Boolean
+    spoiler_text: String
+    comments_disabled: Boolean
+    in_reply_to: Post?
+    published_at: Timestamp
+    edit_count: Integer
+    status: published | withdrawn | taken_down
+
+    media: Media with post = this
+    likes: Like with post = this
+    shares: Share with post = this
+    replies: Post with in_reply_to = this
+
+    transitions status {
+        published -> withdrawn
+        published -> taken_down
+        taken_down -> published
+        taken_down -> withdrawn
+        terminal: withdrawn
+    }
+
+    is_comment: in_reply_to != null
+    likes_count: likes.count
+    shares_count: shares.count
+    reply_count: (replies where status = published).count
+}
+
+entity Follow {
+    follower: Account
+    target: Account
+    status: requested | following
+
+    transitions status {
+        requested -> following
+        terminal: following
+    }
+}
+
+entity Block {
+    blocker: Account
+    blocked: Account
+}
+
+entity Mute {
+    muter: Account
+    muted: Account
+}
+
+entity Like {
+    account: Account
+    post: Post
+}
+
+entity Share {
+    account: Account
+    post: Post
+}
+
+entity Bookmark {
+    account: Account
+    post: Post
+}
+
+entity Hashtag {
+    name: String
+    banned: Boolean
+}
+
+entity HashtagFollow {
+    account: Account
+    hashtag: Hashtag
+}
+
+entity Notification {
+    recipient: Account
+    actor: Account?
+    kind: NotificationKind
+    post: Post?
+    created_at: Timestamp
+    status: unread | seen
+
+    transitions status {
+        unread -> seen
+        terminal: seen
+    }
+}
+
+entity DirectMessage {
+    sender: Account
+    recipient: Account
+    text: String
+    sent_at: Timestamp
+    status: sent | unsent
+
+    transitions status {
+        sent -> unsent
+        terminal: unsent
+    }
+}
+
+entity Report {
+    reporter: Account
+    reason: ReportReason
+    note: String
+    about_post: Post?
+    about_account: Account
+    about_message: DirectMessage?
+    filed_at: Timestamp
+    status: filed | actioned | dismissed
+
+    transitions status {
+        filed -> actioned
+        filed -> dismissed
+        terminal: actioned, dismissed
+    }
+}
+
+-- One thing a moderator did, and the notice of it (S5). The notice is not
+-- a separate entity so that an action cannot exist without one.
+entity ModerationAction {
+    kind: ActionKind
+    subject: Account
+    post: Post?
+    moderator: Account
+    rule_cited: InstanceRule
+    reason: String
+    report: Report?
+    taken_at: Timestamp
+    appeal_text: String?
+    decided_by: Account?
+    status: applied | under_appeal | upheld | reversed
+
+    transitions status {
+        applied -> under_appeal
+        under_appeal -> upheld
+        under_appeal -> reversed
+        terminal: upheld, reversed
+    }
+}
+
+-- One line of the audit log (S15).
+entity AuditEntry {
+    actor: Account
+    what: String
+    at: Timestamp
+}
+
+entity DomainBlock {
+    domain: String
+    reason: String
+    blocked_by: Account
+}
+
+-- One activity on its way to one remote inbox.
+entity Delivery {
+    kind: ActivityKind
+    from: Account
+    inbox: String
+    attempts: Integer
+    next_attempt_at: Timestamp
+    status: queued | delivered | backing_off | abandoned
+
+    transitions status {
+        queued -> delivered
+        queued -> backing_off
+        backing_off -> delivered
+        backing_off -> queued
+        backing_off -> abandoned
+        terminal: delivered, abandoned
+    }
+}
+
+-- One activity received from a remote server.
+entity InboundActivity {
+    kind: ActivityKind
+    origin: RemoteServer
+    actor_uri: String
+    status: awaiting_verification | accepted | refused
+
+    transitions status {
+        awaiting_verification -> accepted
+        awaiting_verification -> refused
+        terminal: accepted, refused
+    }
+}
+
+-- Something the code is known to do wrong or not to do, where the spec
+-- says otherwise or an operator would assume otherwise.
+entity KnownIssue {
+    name: String
+    status: IssueStatus
+    effect: String
+    closes_when: String
+}
+
+-- A person's copy of everything they put here (S8).
+entity Export {
+    account: Account
+    requested_at: Timestamp
+    built_at: Timestamp when status = built
+    status: asked | built | cleared
+
+    transitions status {
+        asked -> built
+        built -> cleared
+        terminal: cleared
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Published at the instance endpoint so a client can apply them first.
+    max_caption_length: Integer = 500
+    max_album_length: Integer = 10
+    max_alt_text_length: Integer = 1000
+    max_spoiler_length: Integer = 140
+    max_message_length: Integer = 2000
+    max_report_note_length: Integer = 255
+    max_edits_per_post: Integer = 10
+    max_upload_kb: Integer = 15000
+    allowed_media_types: List<String> = [ "image/jpeg", "image/png", "image/gif", "image/webp", "video/mp4" ]
+    open_registration: Boolean = false
+    authorization_code_lifetime: Duration = 10.minutes
+    access_token_lifetime: Duration = 365.days
+    unattached_media_lifetime: Duration = 24.hours
+    deletion_grace: Duration = 14.days
+    export_lifetime: Duration = 7.days
+    delivery_max_attempts: Integer = 8
+    delivery_first_backoff: Duration = 1.minute
+    list_page: Integer = 20
+    list_page_max: Integer = 40
+    -- The longest side of a picture, in pixels. The server does not
+    -- decode an upload, but every client that shows it will.
+    max_image_side: Integer = 16384
+}
+
+default KnownIssue no_sign_in_throttle = {
+    name: "the server itself limits nothing: not password guesses, not anything else asked",
+    status: open,
+    effect: "the NixOS module's proxy limits requests per address to the sign-in page and to client registration, which slows one address and does nothing about many; a server run without that proxy has no limit at all. The consent page checks a password on every request. Each check costs one Argon2id computation, the answer for an unknown name takes as long as for a wrong password, and a password is at least twelve characters; beyond that an attacker can try as often as the machine allows, and enough parallel attempts will also exhaust its memory. No other route is limited either: registering a client needs no token and writes a row each time",
+    closes_when: "failed sign-ins are counted per account and per address, further attempts are delayed or refused past a limit, the person is told, and requests without a token are limited per address. Must close before the server faces the internet"
+}
+
+default KnownIssue three_types_refused = {
+    name: "GIF, WebP and MP4 uploads are refused",
+    status: open,
+    effect: "config.allowed_media_types lists five types and the code accepts two, JPEG and PNG, because S19 forbids storing what has not been scrubbed and only those two have a scrubber. A video cannot be posted at all",
+    closes_when: "each of the three has a scrubber with tests against real files, and the code's list equals the config's"
+}
+
+default KnownIssue no_thumbnails = {
+    name: "preview_url is the full file",
+    status: open,
+    effect: "no smaller rendition is made, so a grid of posts downloads every picture at full size, and blurhash is null",
+    closes_when: "the open question on decoding is answered and previews are generated under it"
+}
+
+default KnownIssue timers_run_only_at_use = {
+    name: "nothing in the server runs on a clock",
+    status: open,
+    effect: "rules CodeExpired and TokenExpired are applied when a code or a token is presented, which gives the right answers, but a row nobody presents again keeps its old status. Rule UnattachedMediaCollected never runs: an upload that is never posted and never taken back stays on disk",
+    closes_when: "a worker applies the three temporal rules on a schedule"
+}
+
+default KnownIssue uploads_held_in_memory = {
+    name: "an upload is read into memory whole",
+    status: open,
+    effect: "each upload in flight holds up to max_upload_kb twice, as received and as scrubbed. A handful of clients uploading together can use several hundred megabytes",
+    closes_when: "the body is spooled to a temporary file and scrubbed from there, or concurrent uploads are bounded"
+}
+
+default KnownIssue ids_within_one_millisecond = {
+    name: "two ids made in the same millisecond can sort against their order of creation",
+    status: open,
+    effect: "an id is a millisecond count and a sixteen-bit counter. When the counter wraps inside one millisecond the later row gets the smaller id, so the two sit in a list in the wrong order relative to each other. Ids stay unique and every list stays a consistent order",
+    closes_when: "the id function waits for the next millisecond when its counter wraps, or the ordering is accepted and this entry is closed with that decision"
+}
+
+default KnownIssue client_refuses_this_server = {
+    name: "the Pellucid client has not signed in to this server",
+    status: open,
+    effect: "the client's check_software accepts the name pellucid as of 2026-11-11 (S17), and its decoders and structs read this server's answers. What is left is reach: the client is https only and trusts the public certificate authorities and no others, so it cannot reach a server on a developer's machine, and no server is deployed. Until one is, the server is exercised by its tests and by curl",
+    closes_when: "a session from the client against a deployed server has signed in, posted a photo and read it back"
+}
+
+default KnownIssue module_never_run = {
+    name: "the NixOS module has been evaluated and never run",
+    status: open,
+    effect: "whether the service starts under the module's systemd restrictions, whether nginx accepts the configuration, whether the certificate is issued, and whether the database role is recognised over the socket have not been seen. nix flake check, which runs the test suite inside the build sandbox, has not been run either",
+    closes_when: "the service has run on blade under the module with a certificate issued, pellucid-server-manage has created an account there, and nix flake check has passed on winsmuth"
+}
+
+default KnownIssue flake_unbuilt = {
+    name: "the flake had been evaluated and never built",
+    status: closed,
+    effect: "the code was first compiled and tested with GHC 9.4.7, and the flake pins 9.6.7",
+    closes_when: "Closed 2026-11-11: nix develop and the gate in scripts/check.fish passed on winsmuth with GHC 9.6.7, no warnings, 74 tests. nix flake check moved to module_never_run"
+}
+
+default KnownIssue code_unformatted = {
+    name: "the delivered code is not in fourmolu's layout",
+    status: open,
+    effect: "the files of the first batch were sent as written. fourmolu 0.15.0.0, the version the flake provides, rewrites 34 of the 39 with the repository's fourmolu.yaml; the result was built and tested where the work is written, with no warnings and all tests passing. The gate checks formatting from 2026-11-11, so it fails until the formatter has been run once",
+    closes_when: "fourmolu --mode inplace app src test has been run on winsmuth and the gate passes"
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Accounts ---------------------------------------------------------------
+
+rule AccountRegistered {
+    when: RegistrationSubmitted(_, username, password)
+    requires: config.open_registration
+    requires: not exists Account{username: username, home: null}
+    ensures: Account.created(username: username, display_name: username, note: "", locked: false, is_moderator: false, status: active)
+
+    @guidance
+        -- The password is stored only as a slow salted hash. Usernames are
+        -- compared without case. When registration is closed an operator
+        -- creates accounts; nothing else about them differs.
+}
+
+rule DeletionRequested {
+    when: DeletionRequested(account)
+    requires: account.status = active or account.status = suspended
+    ensures:
+        account.status = leaving
+        account.leaving_since = now
+
+    @guidance
+        -- S9. Suspension does not take away the right to leave.
+}
+
+rule DeletionWithdrawn {
+    when: DeletionWithdrawn(account)
+    requires: account.status = leaving
+    ensures:
+        account.status = active
+        account.leaving_since = null
+}
+
+rule AccountDeparted {
+    when: account: Account.leaving_since + config.deletion_grace <= now
+    requires: account.status = leaving
+    ensures:
+        account.status = departed
+        for post in account.posts where status = published:
+            post.status = withdrawn
+        for follow in account.followers:
+            not exists follow
+        for follow in account.following:
+            not exists follow
+        for token in account.tokens where status = valid:
+            token.status = revoked
+        FederationQueued(kind: delete, from: account)
+
+    @guidance
+        -- Media, likes, bookmarks, messages and notifications of the
+        -- account are removed with it. The username is not reissued.
+}
+
+rule AccountSuspended {
+    when: action: ModerationAction.created
+    requires: action.kind = suspend_account
+    requires: action.subject.status = active
+    ensures: action.subject.status = suspended
+}
+
+rule AccountReinstated {
+    when: action: ModerationAction.status transitions_to reversed
+    requires: action.kind = suspend_account
+    requires: action.subject.status = suspended
+    ensures: action.subject.status = active
+}
+
+rule AccountMoved {
+    when: MoveRequested(account, destination)
+    requires: account.status = active or account.status = suspended
+    requires: account.moved_to = null
+    requires: aliases_include(destination, account)
+    ensures:
+        account.moved_to = destination
+        FederationQueued(kind: move, from: account)
+
+    @guidance
+        -- S8. The destination must name this account as an alias first,
+        -- which is what stops one account from moving another's
+        -- followers. Followers on this server follow the destination at
+        -- once; remote ones act on the Move they receive.
+}
+
+-- OAuth ------------------------------------------------------------------
+
+rule ClientRegistered {
+    when: ClientRegistrationSubmitted(_, name, kind, redirect_uris, scopes)
+    requires: redirect_uris != []
+    requires: scopes != []
+    ensures: OAuthClient.created(name: name, kind: kind, redirect_uris: redirect_uris, scopes: scopes)
+
+    @guidance
+        -- A confidential client also receives a secret, shown once and
+        -- stored hashed. A public client has none (S11).
+}
+
+rule AuthorizationGranted {
+    when: ConsentGiven(account, client, redirect_uri, scopes, pkce)
+    requires: account.status = active or account.status = suspended
+    requires: redirect_uri in client.redirect_uris
+    requires: scopes != [] and scopes.all(s => s in client.scopes)
+    requires: client.kind = confidential_client or pkce != null
+    ensures: AuthorizationCode.created(client: client, account: account, redirect_uri: redirect_uri, scopes: scopes, pkce: pkce, issued_at: now, status: issued)
+
+    @guidance
+        -- A public client without a challenge is refused at the consent
+        -- page. Only S256 is accepted as the method.
+}
+
+rule TokenIssued {
+    when: CodePresented(client, code, redirect_uri, verifier, secret)
+    requires: code.client = client
+    requires: code.status = issued
+    requires: redirect_uri = code.redirect_uri
+    requires: code.pkce = null or challenge_matches(code.pkce, verifier)
+    requires: code.client.kind = public_client or secret_matches(code.client, secret)
+    ensures:
+        code.status = redeemed
+        AccessToken.created(client: code.client, account: code.account, scopes: code.scopes, issued_at: now, status: valid)
+
+    @guidance
+        -- A code is redeemed once. Presenting a redeemed code again
+        -- revokes the token it produced, since one of the two presenters
+        -- stole it.
+}
+
+rule CodeExpired {
+    when: code: AuthorizationCode.issued_at + config.authorization_code_lifetime <= now
+    requires: code.status = issued
+    ensures: code.status = stale
+}
+
+rule TokenRevoked {
+    when: RevocationRequested(account, token)
+    requires: token.status = valid
+    requires: token.account = account
+    ensures: token.status = revoked
+
+    @guidance
+        -- RFC 7009 for the client holding the token, and the same effect
+        -- from the person's list of sessions (S11). Revoking is allowed
+        -- with the very token being revoked.
+}
+
+rule TokenExpired {
+    when: token: AccessToken.issued_at + config.access_token_lifetime <= now
+    requires: token.status = valid
+    ensures: token.status = lapsed
+}
+
+-- Media ------------------------------------------------------------------
+
+rule MediaReceived {
+    when: UploadSubmitted(account, mime, size_bytes)
+    requires: account.status = active
+    requires: mime in config.allowed_media_types
+    requires: size_bytes > 0 and size_bytes <= config.max_upload_kb * 1024
+    ensures: Media.created(owner: account, mime: mime, size_bytes: size_bytes, alt_text: "", uploaded_at: now, status: received)
+}
+
+rule MediaProcessingStarted {
+    when: media: Media.created
+    requires: media.status = received
+    ensures: media.status = processing
+
+    @guidance
+        -- The type is decided by the content, not by the declared MIME
+        -- type. Metadata that locates the person (EXIF position, device
+        -- serial) is stripped before anything is stored for serving
+        -- (S19). A picture with a side longer than config.max_image_side,
+        -- and a file that ends before its image does, fail processing.
+}
+
+rule MediaProcessed {
+    when: ProcessingFinished(media)
+    requires: media.status = processing
+    ensures: media.status = ready
+}
+
+rule MediaProcessingFailed {
+    when: ProcessingFailed(media)
+    requires: media.status = processing
+    ensures: media.status = unusable
+}
+
+rule MediaTakenBack {
+    when: MediaDeleteRequested(account, media)
+    requires: media.owner = account
+    requires: media.status = ready or media.status = unusable
+    ensures: media.status = purged
+
+    @guidance
+        -- S13. Only before the media is attached; afterwards it leaves
+        -- with its post or by an edit that names it.
+}
+
+rule UnattachedMediaCollected {
+    when: media: Media.uploaded_at + config.unattached_media_lifetime <= now
+    requires: media.status = ready or media.status = unusable
+    ensures: media.status = purged
+}
+
+rule MediaAttached {
+    when: AttachRequested(media, post)
+    requires: media.status = ready
+    ensures:
+        media.status = attached
+        media.post = post
+
+    @guidance
+        -- Emitted by rule PostPublished for each attachment. A media item
+        -- is attached to one post, once.
+}
+
+rule MediaReleased {
+    when: ReleaseRequested(media)
+    requires: media.status = attached
+    ensures: media.status = purged
+
+    @guidance
+        -- Emitted when a post is withdrawn and when an edit names an
+        -- attachment for removal (S14). The stored file goes with it.
+}
+
+-- Posts ------------------------------------------------------------------
+
+rule PostPublished {
+    when: PostSubmitted(author, caption, attachments, visibility, sensitive, spoiler_text, comments_disabled)
+    requires: author.status = active
+    requires: attachments.count > 0 and attachments.count <= config.max_album_length
+    requires: attachments.all(m => m.owner = author and m.status = ready)
+    requires: length_of(caption) <= config.max_caption_length
+    requires: length_of(spoiler_text) <= config.max_spoiler_length
+    ensures:
+        let post = Post.created(author: author, caption: caption, visibility: visibility, sensitive: sensitive, spoiler_text: spoiler_text, comments_disabled: comments_disabled, published_at: now, edit_count: 0, status: published)
+        for media in attachments:
+            AttachRequested(media: media, post: post)
+        FederationQueued(kind: create, from: author)
+
+    @guidance
+        -- A post needs media; a comment (rule CommentPublished) does not.
+        -- Mentions in the caption notify the accounts mentioned; hashtags
+        -- are indexed. A direct post is a DirectMessage, not a Post.
+}
+
+rule CommentPublished {
+    when: CommentSubmitted(author, parent, text)
+    requires: author.status = active
+    requires: parent.status = published and not parent.comments_disabled
+    requires: can_see(author, parent)
+    requires: not exists Block{blocker: parent.author, blocked: author}
+    requires: trimmed(text) != "" and length_of(text) <= config.max_caption_length
+    ensures:
+        Post.created(author: author, caption: text, visibility: parent.visibility, sensitive: false, spoiler_text: "", comments_disabled: false, in_reply_to: parent, published_at: now, edit_count: 0, status: published)
+        if parent.author != author:
+            Notification.created(recipient: parent.author, actor: author, kind: commented, post: parent, created_at: now, status: unread)
+        FederationQueued(kind: create, from: author)
+}
+
+rule PostEdited {
+    when: EditSubmitted(author, post, caption, sensitive, spoiler_text, removed)
+    requires: post.author = author and author.status = active
+    requires: post.status = published
+    requires: post.edit_count < config.max_edits_per_post
+    requires: length_of(caption) <= config.max_caption_length
+    requires: removed.all(m => m.post = post)
+    requires: post.is_comment or post.media.count - removed.count > 0
+    ensures:
+        post.caption = caption
+        post.sensitive = sensitive
+        post.spoiler_text = spoiler_text
+        post.edit_count = post.edit_count + 1
+        for media in removed:
+            ReleaseRequested(media: media)
+        FederationQueued(kind: update, from: author)
+
+    @guidance
+        -- S14. A field the request does not carry keeps its value, and an
+        -- attachment leaves only when the request names it. The earlier
+        -- text is kept as history the author and, for a public post,
+        -- anyone can read.
+}
+
+rule PostWithdrawn {
+    when: PostDeleteRequested(author, post)
+    requires: post.author = author
+    requires: post.status = published or post.status = taken_down
+    ensures:
+        post.status = withdrawn
+        for media in post.media:
+            ReleaseRequested(media: media)
+        for like in post.likes:
+            not exists like
+        for share in post.shares:
+            not exists share
+        FederationQueued(kind: delete, from: author)
+
+    @guidance
+        -- The author can always delete, including a post a moderator has
+        -- taken down. Comments under a deleted post stay, as their
+        -- authors' posts, and lose their parent.
+}
+
+rule PostTakenDown {
+    when: action: ModerationAction.created
+    requires: action.kind = remove_post
+    requires: action.post != null
+    let post = action.post
+    requires: post.status = published
+    ensures: post.status = taken_down
+
+    @guidance
+        -- A taken-down post is hidden from everyone but its author and
+        -- the moderators, and is kept so that an appeal can restore it.
+}
+
+rule PostRestored {
+    when: action: ModerationAction.status transitions_to reversed
+    requires: action.kind = remove_post
+    requires: action.post != null
+    let post = action.post
+    requires: post.status = taken_down
+    ensures: post.status = published
+}
+
+-- Likes, shares, bookmarks -----------------------------------------------
+
+rule PostLiked {
+    when: LikeSubmitted(account, post)
+    requires: account.status = active
+    requires: post.status = published and can_see(account, post)
+    requires: not exists Like{account: account, post: post}
+    ensures:
+        Like.created(account: account, post: post)
+        if post.author != account:
+            Notification.created(recipient: post.author, actor: account, kind: liked, post: post, created_at: now, status: unread)
+        FederationQueued(kind: like, from: account)
+}
+
+rule PostUnliked {
+    when: UnlikeSubmitted(account, post)
+    let like = Like{account: account, post: post}
+    requires: exists like
+    ensures:
+        not exists like
+        FederationQueued(kind: undo, from: account)
+}
+
+rule PostShared {
+    when: ShareSubmitted(account, post)
+    requires: account.status = active
+    requires: post.status = published and post.visibility = public
+    requires: not exists Block{blocker: post.author, blocked: account}
+    requires: not exists Share{account: account, post: post}
+    ensures:
+        Share.created(account: account, post: post)
+        if post.author != account:
+            Notification.created(recipient: post.author, actor: account, kind: shared, post: post, created_at: now, status: unread)
+        FederationQueued(kind: announce, from: account)
+
+    @guidance
+        -- The answer to the request carries the count after the share,
+        -- not before it: counting is part of the rule, not a later job.
+}
+
+rule PostUnshared {
+    when: UnshareSubmitted(account, post)
+    let share = Share{account: account, post: post}
+    requires: exists share
+    ensures:
+        not exists share
+        FederationQueued(kind: undo, from: account)
+}
+
+rule PostBookmarked {
+    when: BookmarkSubmitted(account, post)
+    requires: post.status = published and can_see(account, post)
+    requires: not exists Bookmark{account: account, post: post}
+    ensures: Bookmark.created(account: account, post: post)
+
+    @guidance
+        -- A bookmark is private: it notifies nobody and is not federated.
+}
+
+rule PostUnbookmarked {
+    when: UnbookmarkSubmitted(account, post)
+    let bookmark = Bookmark{account: account, post: post}
+    requires: exists bookmark
+    ensures: not exists bookmark
+}
+
+-- Follows, blocks, mutes -------------------------------------------------
+
+rule FollowedOpenAccount {
+    when: FollowSubmitted(follower, target)
+    requires: follower.status = active and target.status = active
+    requires: follower != target and not target.locked
+    requires: not exists Follow{follower: follower, target: target}
+    requires: not exists Block{blocker: target, blocked: follower}
+    requires: not exists Block{blocker: follower, blocked: target}
+    ensures:
+        Follow.created(follower: follower, target: target, status: following)
+        Notification.created(recipient: target, actor: follower, kind: followed, created_at: now, status: unread)
+        FederationQueued(kind: follow, from: follower)
+}
+
+rule FollowRequestedOfLockedAccount {
+    when: FollowSubmitted(follower, target)
+    requires: follower.status = active and target.status = active
+    requires: follower != target and target.locked
+    requires: not exists Follow{follower: follower, target: target}
+    requires: not exists Block{blocker: target, blocked: follower}
+    requires: not exists Block{blocker: follower, blocked: target}
+    ensures:
+        Follow.created(follower: follower, target: target, status: requested)
+        Notification.created(recipient: target, actor: follower, kind: follow_requested, created_at: now, status: unread)
+        FederationQueued(kind: follow, from: follower)
+}
+
+rule FollowRequestAccepted {
+    when: FollowRequestAccepted(target, follow)
+    requires: follow.target = target
+    requires: follow.status = requested
+    ensures:
+        follow.status = following
+        FederationQueued(kind: accept, from: target)
+}
+
+rule FollowRequestRejected {
+    when: FollowRequestRejected(target, follow)
+    requires: follow.target = target
+    requires: follow.status = requested
+    ensures:
+        not exists follow
+        FederationQueued(kind: reject, from: target)
+}
+
+rule Unfollowed {
+    when: UnfollowSubmitted(follower, target)
+    let follow = Follow{follower: follower, target: target}
+    requires: exists follow
+    ensures:
+        not exists follow
+        FederationQueued(kind: undo, from: follower)
+
+    @guidance
+        -- Also how a pending request is withdrawn.
+}
+
+rule AccountBlocked {
+    when: BlockSubmitted(blocker, blocked)
+    requires: blocker != blocked
+    requires: not exists Block{blocker: blocker, blocked: blocked}
+    let outgoing = Follow{follower: blocker, target: blocked}
+    let incoming = Follow{follower: blocked, target: blocker}
+    ensures:
+        Block.created(blocker: blocker, blocked: blocked)
+        not exists outgoing
+        not exists incoming
+        FederationQueued(kind: block, from: blocker)
+
+    @guidance
+        -- A moderator can be blocked like anyone else. Pixelfed refuses to
+        -- let an admin be blocked; a moderator's notices still arrive,
+        -- because they come from the instance and not from the person.
+}
+
+rule AccountUnblocked {
+    when: UnblockSubmitted(blocker, blocked)
+    let block = Block{blocker: blocker, blocked: blocked}
+    requires: exists block
+    ensures:
+        not exists block
+        FederationQueued(kind: undo, from: blocker)
+}
+
+rule AccountMuted {
+    when: MuteSubmitted(muter, muted)
+    requires: muter != muted
+    requires: not exists Mute{muter: muter, muted: muted}
+    ensures: Mute.created(muter: muter, muted: muted)
+
+    @guidance
+        -- A mute is private: the muted account is never told and nothing
+        -- is federated.
+}
+
+rule AccountUnmuted {
+    when: UnmuteSubmitted(muter, muted)
+    let mute = Mute{muter: muter, muted: muted}
+    requires: exists mute
+    ensures: not exists mute
+}
+
+rule HashtagFollowed {
+    when: HashtagFollowSubmitted(account, hashtag)
+    requires: not hashtag.banned
+    requires: not exists HashtagFollow{account: account, hashtag: hashtag}
+    ensures: HashtagFollow.created(account: account, hashtag: hashtag)
+
+    @guidance
+        -- A tag nobody has used yet can be followed; Pixelfed answers 422.
+}
+
+rule HashtagUnfollowed {
+    when: HashtagUnfollowSubmitted(account, hashtag)
+    let followed = HashtagFollow{account: account, hashtag: hashtag}
+    requires: exists followed
+    ensures: not exists followed
+}
+
+rule NotificationSeen {
+    when: NotificationsRead(recipient, notification)
+    requires: notification.recipient = recipient
+    requires: notification.status = unread
+    ensures: notification.status = seen
+}
+
+-- Direct messages --------------------------------------------------------
+
+rule MessageSent {
+    when: MessageSubmitted(sender, recipient, text)
+    requires: sender.status = active and recipient.status = active
+    requires: sender != recipient
+    requires: trimmed(text) != "" and length_of(text) <= config.max_message_length
+    requires: not exists Block{blocker: recipient, blocked: sender}
+    requires: not exists Block{blocker: sender, blocked: recipient}
+    ensures:
+        DirectMessage.created(sender: sender, recipient: recipient, text: text, sent_at: now, status: sent)
+        Notification.created(recipient: recipient, actor: sender, kind: message_received, created_at: now, status: unread)
+
+    @guidance
+        -- A message from someone the recipient does not follow arrives as
+        -- a request the recipient accepts or ignores. To a remote
+        -- recipient the message is delivered to that one inbox only.
+}
+
+rule MessageUnsent {
+    when: MessageDeleteRequested(sender, message)
+    requires: message.sender = sender
+    requires: message.status = sent
+    ensures: message.status = unsent
+}
+
+-- Reports and moderation -------------------------------------------------
+
+rule ReportFiled {
+    when: ReportSubmitted(reporter, reason, note, about_account, about_post, about_message)
+    requires: reporter.status = active
+    requires: about_account != reporter
+    requires: length_of(note) <= config.max_report_note_length
+    requires: about_message = null or about_message.recipient = reporter or about_message.sender = reporter
+    ensures:
+        Report.created(reporter: reporter, reason: reason, note: note, about_account: about_account, about_post: about_post, about_message: about_message, filed_at: now, status: filed)
+        if not about_account.is_local:
+            FederationQueued(kind: flag, from: reporter)
+
+    @guidance
+        -- A report about a direct message can only come from one of its
+        -- two participants, and it is what lets a moderator read that
+        -- message (S15). The reported account is not told who reported.
+}
+
+rule ReportDismissed {
+    when: ReportDismissed(moderator, report, reason)
+    requires: moderator.is_moderator and moderator.status = active
+    requires: report.status = filed
+    ensures:
+        report.status = dismissed
+        AuditEntry.created(actor: moderator, what: reason, at: now)
+}
+
+rule ActionTaken {
+    when: ActionDecided(moderator, kind, subject, post, rule_cited, reason, report)
+    requires: moderator.is_moderator and moderator.status = active
+    requires: moderator != subject
+    requires: trimmed(reason) != ""
+    requires: report = null or report.status = filed
+    ensures:
+        ModerationAction.created(kind: kind, subject: subject, post: post, moderator: moderator, rule_cited: rule_cited, reason: reason, report: report, taken_at: now, status: applied)
+        Notification.created(recipient: subject, kind: moderation_notice, post: post, created_at: now, status: unread)
+        AuditEntry.created(actor: moderator, what: reason, at: now)
+        if report != null:
+            ReportClosed(report: report)
+
+    @guidance
+        -- S5. The action and its notice are one entity, so one cannot be
+        -- written without the other; the notification is how the notice
+        -- reaches the person. A moderator cannot act on their own account.
+        -- limit_reach and mark_sensitive take effect through the reading
+        -- rules (invariants below), not through a status of their own.
+}
+
+rule ReportActioned {
+    when: ReportClosed(report)
+    requires: report.status = filed
+    ensures: report.status = actioned
+}
+
+rule AppealFiled {
+    when: AppealSubmitted(subject, action, text)
+    requires: action.subject = subject
+    requires: action.status = applied
+    requires: trimmed(text) != ""
+    ensures:
+        action.status = under_appeal
+        action.appeal_text = text
+
+    @guidance
+        -- S6. One appeal per action. The action stays in force while the
+        -- appeal is open; a suspended account can file one, since filing
+        -- needs only a session.
+}
+
+rule AppealUpheld {
+    when: AppealDecided(reviewer, action, grant)
+    requires: reviewer.is_moderator and reviewer.status = active
+    requires: reviewer != action.moderator and reviewer != action.subject
+    requires: action.status = under_appeal
+    requires: not grant
+    ensures:
+        action.status = upheld
+        action.decided_by = reviewer
+        Notification.created(recipient: action.subject, kind: moderation_notice, post: action.post, created_at: now, status: unread)
+        AuditEntry.created(actor: reviewer, what: "appeal upheld", at: now)
+}
+
+rule AppealGranted {
+    when: AppealDecided(reviewer, action, grant)
+    requires: reviewer.is_moderator and reviewer.status = active
+    requires: reviewer != action.moderator and reviewer != action.subject
+    requires: action.status = under_appeal
+    requires: grant
+    ensures:
+        action.status = reversed
+        action.decided_by = reviewer
+        Notification.created(recipient: action.subject, kind: moderation_notice, post: action.post, created_at: now, status: unread)
+        AuditEntry.created(actor: reviewer, what: "appeal granted", at: now)
+
+    @guidance
+        -- Reversal undoes the action's effect: rules AccountReinstated
+        -- and PostRestored fire on it.
+}
+
+rule DomainBlocked {
+    when: DomainBlockDecided(moderator, domain, reason)
+    requires: moderator.is_moderator and moderator.status = active
+    requires: trimmed(reason) != ""
+    requires: not exists DomainBlock{domain: domain}
+    ensures:
+        DomainBlock.created(domain: domain, reason: reason, blocked_by: moderator)
+        AuditEntry.created(actor: moderator, what: reason, at: now)
+
+    @guidance
+        -- S7. The list and each reason are public. People who follow
+        -- accounts on the domain are told before the follows are cut.
+}
+
+-- Federation -------------------------------------------------------------
+
+rule DeliveriesQueued {
+    when: FederationQueued(kind, from)
+    requires: from.is_local
+    ensures:
+        for inbox in inboxes_addressed(kind, from):
+            Delivery.created(kind: kind, from: from, inbox: inbox, attempts: 0, next_attempt_at: now, status: queued)
+
+    @guidance
+        -- inboxes_addressed is the audience of the activity and nothing
+        -- wider (contract ActivityPub, AddressedOnly): shared inboxes are
+        -- used where a server offers one, blocked domains are left out.
+}
+
+rule DeliverySucceeded {
+    when: DeliveryAnswered(_, delivery, accepted)
+    requires: delivery.status = queued
+    requires: accepted
+    ensures: delivery.status = delivered
+}
+
+rule DeliveryRefused {
+    when: DeliveryAnswered(_, delivery, accepted)
+    requires: delivery.status = queued
+    requires: not accepted
+    ensures:
+        delivery.status = backing_off
+        delivery.attempts = delivery.attempts + 1
+        delivery.next_attempt_at = now + backoff_after(delivery.attempts)
+}
+
+rule DeliveryRetried {
+    when: delivery: Delivery.next_attempt_at <= now
+    requires: delivery.status = backing_off
+    requires: delivery.attempts < config.delivery_max_attempts
+    ensures: delivery.status = queued
+}
+
+rule DeliveryAbandoned {
+    when: delivery: Delivery.next_attempt_at <= now
+    requires: delivery.status = backing_off
+    requires: delivery.attempts >= config.delivery_max_attempts
+    ensures: delivery.status = abandoned
+
+    @guidance
+        -- backoff_after doubles from delivery_first_backoff. A server that
+        -- has refused everything for a week is marked unreachable and
+        -- probed daily rather than sent every activity.
+}
+
+rule InboundArrived {
+    when: ActivityReceived(origin, kind, actor_uri)
+    ensures: InboundActivity.created(kind: kind, origin: origin, actor_uri: actor_uri, status: awaiting_verification)
+}
+
+rule InboundAccepted {
+    when: SignatureChecked(inbound, valid)
+    requires: inbound.status = awaiting_verification
+    requires: valid
+    requires: exists RemoteServer{domain: inbound.origin.domain}
+    requires: not exists DomainBlock{domain: inbound.origin.domain}
+    ensures: inbound.status = accepted
+
+    @guidance
+        -- An accepted activity is applied through the same rules a local
+        -- request goes through, with the remote account as the actor, so
+        -- a block or a locked account means the same to both.
+}
+
+rule InboundRefused {
+    when: SignatureChecked(inbound, valid)
+    requires: inbound.status = awaiting_verification
+    requires: not valid or exists DomainBlock{domain: inbound.origin.domain}
+    ensures: inbound.status = refused
+}
+
+-- Export -----------------------------------------------------------------
+
+rule ExportRequested {
+    when: ExportRequested(account)
+    requires: account.status != departed
+    ensures: Export.created(account: account, requested_at: now, status: asked)
+
+    @guidance
+        -- S8. Not refused to a suspended or a leaving account.
+}
+
+rule ExportBuilt {
+    when: ExportFinished(export)
+    requires: export.status = asked
+    ensures:
+        export.status = built
+        export.built_at = now
+}
+
+rule ExportCleared {
+    when: export: Export.built_at + config.export_lifetime <= now
+    requires: export.status = built
+    ensures:
+        export.status = cleared
+        export.built_at = null
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant OneLikePerAccountAndPost {
+    for a in Likes:
+        for b in Likes:
+            a != b implies a.account != b.account or a.post != b.post
+}
+
+invariant OneShareOfPublicPostsOnly {
+    for s in Shares:
+        s.post.visibility = public
+}
+
+invariant OneFollowPerPair {
+    for a in Follows:
+        for b in Follows:
+            a != b implies a.follower != b.follower or a.target != b.target
+}
+
+invariant NobodyFollowsThemselves {
+    for f in Follows:
+        f.follower != f.target
+}
+
+invariant NoFollowAcrossABlock {
+    for b in Blocks:
+        not exists Follow{follower: b.blocker, target: b.blocked}
+        and not exists Follow{follower: b.blocked, target: b.blocker}
+}
+
+invariant AttachedMediaBelongsToItsPostsAuthor {
+    for m in Media:
+        m.status = attached implies m.post != null and m.post.author = m.owner
+}
+
+invariant PostsHaveMediaAndCommentsNeedNone {
+    for p in Posts:
+        p.status = published and not p.is_comment implies p.media.count > 0
+}
+
+invariant EditsAreBounded {
+    for p in Posts:
+        p.edit_count <= config.max_edits_per_post
+}
+
+invariant PublicClientsAlwaysUsePkce {
+    for c in AuthorizationCodes:
+        c.client.kind = public_client implies c.pkce != null
+}
+
+invariant PublicClientsHoldNoSecret {
+    for c in OAuthClients:
+        c.kind = public_client implies c.secret_hash = null
+}
+
+invariant NoActionWithoutAReason {
+    -- S5.
+    for a in ModerationActions:
+        a.reason != ""
+}
+
+invariant NobodyModeratesThemselves {
+    for a in ModerationActions:
+        a.moderator != a.subject
+}
+
+invariant AppealsAreDecidedBySomeoneElse {
+    -- S6.
+    for a in ModerationActions:
+        a.status in { upheld, reversed } implies a.decided_by != null and a.decided_by != a.moderator
+}
+
+invariant DepartedAccountsHoldNothing {
+    -- S9.
+    for a in Accounts:
+        a.status = departed implies
+            (a.posts where status = published).count = 0
+            and a.followers.count = 0
+            and a.following.count = 0
+            and (a.tokens where status = valid).count = 0
+}
+
+-- Reading rules. Who may see what is a property of every read, not of an
+-- entity's state, so it is stated here and demanded of surface ClientApi:
+--
+--   can_see(viewer, post)   the post is published, and: it is public or
+--                           unlisted; or it is followers_only and viewer
+--                           is its author or an accepted follower; and
+--                           neither of viewer and author blocks the
+--                           other. A taken_down post is seen by its
+--                           author and by moderators only.
+--   home timeline           the viewer's own published posts, and
+--                           those of accounts the viewer follows and of
+--                           hashtags the viewer follows that the viewer
+--                           can see, minus muted accounts, newest first,
+--                           nothing else (S10). Comments are not in it.
+--   public timeline         public posts by local accounts that are not
+--                           under an applied limit_reach action.
+--   limit_reach             keeps an account's posts out of the public
+--                           timeline, hashtag feeds and trending lists.
+--                           Followers still see them and the account is
+--                           told (S5): this is the only form of reduced
+--                           reach there is.
+--   mark_sensitive          the post is served with sensitive true.
+--   trending                local public posts of the range ordered by
+--                           likes, by a rule the about page states.
+--   direct messages         readable by sender and recipient; by a
+--                           moderator only for a message named in a
+--                           report filed by a participant (S15).
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor Member {
+    identified_by: Account where status = active or status = suspended or status = leaving
+}
+
+actor Moderator {
+    identified_by: Account where is_moderator and status = active
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- Before there is a session: registration, the consent page, the token
+-- endpoint.
+surface SignIn {
+    facing client: OAuthClient
+
+    exposes:
+        client.name
+        client.kind
+        client.redirect_uris
+        client.scopes
+        client.codes.count
+        config.open_registration
+
+    provides:
+        RegistrationSubmitted(client, username, password) when config.open_registration
+        ClientRegistrationSubmitted(client, name, kind, redirect_uris, scopes)
+        CodePresented(client, code, redirect_uri, verifier, secret)
+
+    @guarantee SecretsAreNeverReturnedTwice
+        -- A client secret is shown at registration and stored hashed; a
+        -- password is never stored or logged in a form that can be read.
+}
+
+-- The client API with a token (contract ClientApiCompat).
+surface ClientApi {
+    facing member: Member
+
+    exposes:
+        member.username
+        member.display_name
+        member.note
+        member.locked
+        member.status
+        member.moved_to
+        member.is_local
+        member.accepted_followers.count
+        member.blocks.count
+        for post in member.posts:
+            post.caption
+            post.visibility
+            post.sensitive
+            post.spoiler_text
+            post.comments_disabled
+            post.published_at
+            post.edit_count
+            post.status
+            post.likes_count
+            post.shares_count
+            post.reply_count
+        for token in member.tokens:
+            token.scopes
+            token.issued_at
+            token.status
+        for notice in member.notices:
+            notice.kind
+            notice.rule_cited
+            notice.reason
+            notice.taken_at
+            notice.status
+            notice.appeal_text
+
+    provides:
+        ConsentGiven(member, client, redirect_uri, scopes, pkce)
+        RevocationRequested(member, token)
+        UploadSubmitted(member, mime, size_bytes) when member.status = active
+        MediaDeleteRequested(member, media)
+        PostSubmitted(member, caption, attachments, visibility, sensitive, spoiler_text, comments_disabled) when member.status = active
+        CommentSubmitted(member, parent, text) when member.status = active
+        EditSubmitted(member, post, caption, sensitive, spoiler_text, removed) when member.status = active
+        PostDeleteRequested(member, post)
+        LikeSubmitted(member, post) when member.status = active
+        UnlikeSubmitted(member, post)
+        ShareSubmitted(member, post) when member.status = active
+        UnshareSubmitted(member, post)
+        BookmarkSubmitted(member, post)
+        UnbookmarkSubmitted(member, post)
+        FollowSubmitted(member, target) when member.status = active
+        FollowRequestAccepted(member, follow)
+        FollowRequestRejected(member, follow)
+        UnfollowSubmitted(member, target)
+        BlockSubmitted(member, blocked)
+        UnblockSubmitted(member, blocked)
+        MuteSubmitted(member, muted)
+        UnmuteSubmitted(member, muted)
+        HashtagFollowSubmitted(member, hashtag)
+        HashtagUnfollowSubmitted(member, hashtag)
+        NotificationsRead(member, notification)
+        MessageSubmitted(member, recipient, text) when member.status = active
+        MessageDeleteRequested(member, message)
+        ReportSubmitted(member, reason, note, about_account, about_post, about_message) when member.status = active
+        AppealSubmitted(member, action, text)
+        ExportRequested(member)
+        MoveRequested(member, destination)
+        DeletionRequested(member)
+        DeletionWithdrawn(member) when member.status = leaving
+
+    contracts:
+        fulfils ClientApiCompat
+
+    @guarantee SuspensionLeavesTheWayOut
+        -- A suspended account cannot post, comment, like, share, follow,
+        -- message or report. It can still read its notices, appeal,
+        -- export, move, delete its posts and delete itself (S8, S9).
+
+    @guarantee ReadsObeyTheReadingRules
+        -- No route returns a post the viewer cannot see under can_see,
+        -- whichever list, search or notification it would arrive in.
+
+    @guarantee NothingIsInsertedIntoAFeed
+        -- S10.
+}
+
+surface ModerationDesk {
+    facing moderator: Moderator
+
+    exposes:
+        moderator.username
+        for report in Reports where status = filed:
+            report.reason
+            report.note
+            report.filed_at
+            report.status
+        for entry in AuditEntries:
+            entry.actor
+            entry.what
+            entry.at
+        for blocked in DomainBlocks:
+            blocked.domain
+            blocked.reason
+            blocked.blocked_by
+
+    provides:
+        ReportDismissed(moderator, report, reason)
+        ActionDecided(moderator, kind, subject, post, rule_cited, reason, report)
+        AppealDecided(moderator, action, grant)
+        DomainBlockDecided(moderator, domain, reason)
+
+    @guarantee NoSilentActions
+        -- S5. There is no control here that changes what an account or a
+        -- post can reach without rule ActionTaken, and so without a
+        -- notice.
+
+    @guarantee MessagesStayPrivate
+        -- S15. No list, search or lookup on this surface returns a direct
+        -- message that is not named in an open report by a participant.
+
+    @guarantee EverythingIsLogged
+        -- Every provided operation writes an AuditEntry.
+}
+
+-- What anyone can read without an account (S7).
+surface PublicRecord {
+    facing reader: RemoteServer
+
+    exposes:
+        reader.domain
+        for blocked in DomainBlocks:
+            blocked.domain
+            blocked.reason
+        (ModerationActions where status = applied).count
+        (ModerationActions where status = reversed).count
+
+    @guarantee NobodyIsNamed
+        -- Counts by kind and month, and blocked domains with reasons. No
+        -- account, post or report appears.
+}
+
+-- Other servers.
+surface Federation {
+    facing remote: RemoteServer
+
+    exposes:
+        remote.domain
+        remote.shared_inbox
+        for delivery in Deliveries:
+            delivery.kind
+            delivery.inbox
+            delivery.attempts
+            delivery.next_attempt_at
+            delivery.status
+
+    provides:
+        ActivityReceived(remote, kind, actor_uri)
+        DeliveryAnswered(remote, delivery, accepted)
+
+    contracts:
+        fulfils ActivityPub
+
+    @guarantee NothingBeyondTheAudience
+        -- S16.
+}
+
+-- The server's own workers: media processing, signature checks, exports.
+surface Workers {
+    facing worker: Account
+
+    exposes:
+        worker.is_moderator
+        for media in Media:
+            media.mime
+            media.size_bytes
+            media.alt_text
+            media.status
+        for inbound in InboundActivities:
+            inbound.kind
+            inbound.actor_uri
+            inbound.status
+        for export in Exports:
+            export.requested_at
+            export.status
+
+    provides:
+        ProcessingFinished(media)
+        ProcessingFailed(media)
+        SignatureChecked(inbound, valid)
+        ExportFinished(export)
+
+    @guidance
+        -- These are internal completions, modelled as a surface so that
+        -- every trigger has a source. The facing account stands for the
+        -- instance's own actor.
+}
+
+-- The repository as the person who runs the server meets it.
+surface OperatorShell {
+    facing operator: Account
+
+    exposes:
+        operator.username
+        for issue in KnownIssues where status = open:
+            issue.name
+            issue.effect
+            issue.closes_when
+
+    @guidance
+        -- pellucid-server serve applies migrations and listens, on this
+        -- machine only by default, for a reverse proxy to reach.
+        -- pellucid-server migrate applies migrations and stops.
+        -- pellucid-server create-account NAME [--moderator] is rule
+        -- AccountRegistered for an operator; the password is read from
+        -- standard input and is at least twelve characters. Settings come
+        -- from flags or from PELLUCID_DATABASE_URL, PELLUCID_BASE_URL,
+        -- PELLUCID_TITLE, PELLUCID_MEDIA_DIR, PELLUCID_HOST and
+        -- PELLUCID_PORT. Development: nix develop, cabal build all,
+        -- cabal test all, fish scripts/check.fish. On a machine that
+        -- runs the NixOS module, pellucid-server-manage takes the same
+        -- commands; it is run as root and runs them as the service's
+        -- user with the service's settings.
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+deferred ActivityPub.protocol          -- see: https://www.w3.org/TR/activitypub/ and https://docs.joinmastodon.org/spec/activitypub/
+deferred HttpSignatures.draft          -- see: draft-cavage-http-signatures-12 and RFC 9421
+deferred OAuth2.pkce                   -- see: RFC 6749, RFC 7636, RFC 7009
+deferred Pixelfed.client_api           -- see: pellucid.allium contracts PixelfedApi and Pagers
+deferred Stories.lifecycle             -- see: not written; Pixelfed's app/Http/Controllers/Stories
+deferred Collections.lifecycle         -- see: not written; Pixelfed's /api/v1.1/collections
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Whether decisions S5 to S16 are what less authoritarian means. They are a reading of the phrase, written down so it can be corrected; each one that is wrong should be struck before any code depends on it."
+open question "How previews and blurhashes are made under S19. A smaller rendition needs the picture decoded, and a decoder is the largest attack surface a media server has. The candidates are a decoder in a separate process with no network, no filesystem and a memory limit, or accepting full-size previews and making none."
+open question "What a suspension does to the posts the account already made. The rules say what a suspended account cannot do and nothing about whether its posts stay in timelines and on its profile. The code follows the rules as written: they stay."
+open question "How sign-in attempts are limited (KnownIssue no_sign_in_throttle) without turning the limit into a way to lock a person out of their own account by guessing at it."
+open question "Whether the client API should stay Pixelfed-compatible indefinitely or only until Pellucid's own client is the main one. Compatibility is S1; it also fixes the entity shapes, the four historical pagination parameters and the _pe flag in place."
+open question "Whether direct messages should be end-to-end encrypted between Pellucid servers, which S15 would then enforce by construction, and what is shown to a recipient on a server that cannot decrypt."
+open question "How an instance with a single moderator satisfies S6. The appeal can be recorded and answered, but not by someone else; a shared appeals pool between cooperating instances is one answer."
+open question "Whether trending lists should exist at all under S10, or whether discovery is hashtags and search only."
+open question "What stories, collections and groups look like under these decisions. They are deferred, not rejected."

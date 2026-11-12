@@ -1,0 +1,9 @@
+dist-newstyle/*
+cabal.project.local
+result
+result-*
+.direnv/
+media/
+.dev-postgres/
+.dev-media/
+dist/

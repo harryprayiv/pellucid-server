@@ -1,0 +1,127 @@
+cabal-version:      3.0
+name:               pellucid-server
+version:            0.1.0.0
+synopsis:           The Pellucid server: a photo-sharing server that speaks the Pixelfed client API
+license:            AGPL-3.0-or-later
+author:             Harry Pray IV
+maintainer:         harry@harryprayiv.com
+build-type:         Simple
+common shared
+  default-language: GHC2021
+  default-extensions:
+    BlockArguments
+    DerivingStrategies
+    DuplicateRecordFields
+    LambdaCase
+    NamedFieldPuns
+    NoFieldSelectors
+    OverloadedRecordDot
+    OverloadedStrings
+    RecordWildCards
+    StrictData
+  ghc-options:
+    -Wall
+    -Wcompat
+    -Widentities
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+    -Wmissing-export-lists
+    -Wredundant-constraints
+    -Wpartial-fields
+    -Wunused-packages
+  build-depends:
+    base >=4.17 && <5
+
+library
+  import:          shared
+  hs-source-dirs:  src
+  exposed-modules:
+    Pellucid.Config
+    Pellucid.Domain.Account
+    Pellucid.Domain.Cursor
+    Pellucid.Domain.Follow
+    Pellucid.Domain.Ids
+    Pellucid.Domain.Limits
+    Pellucid.Domain.OAuth
+    Pellucid.Domain.Pkce
+    Pellucid.Domain.Post
+    Pellucid.Domain.Scrub
+    Pellucid.Domain.Username
+    Pellucid.Http.App
+    Pellucid.Http.Entities
+    Pellucid.Http.Pages
+    Pellucid.Http.Params
+    Pellucid.Http.Respond
+    Pellucid.Http.Router
+    Pellucid.Http.Routes.Accounts
+    Pellucid.Http.Routes.Instance
+    Pellucid.Http.Routes.Media
+    Pellucid.Http.Routes.OAuth
+    Pellucid.Http.Routes.Statuses
+    Pellucid.Secret
+    Pellucid.Store
+    Pellucid.Store.Accounts
+    Pellucid.Store.Media
+    Pellucid.Store.OAuth
+    Pellucid.Store.Posts
+    Pellucid.Store.Schema
+  build-depends:
+    aeson >=2.1,
+    base16-bytestring,
+    base64-bytestring,
+    bytestring,
+    containers,
+    cryptohash-sha256,
+    directory,
+    entropy,
+    filepath,
+    http-types,
+    password,
+    postgresql-simple,
+    resource-pool >=0.4,
+    text,
+    time,
+    transformers,
+    wai,
+    wai-extra
+
+executable pellucid-server
+  import:          shared
+  hs-source-dirs:  app
+  main-is:         Main.hs
+  ghc-options:     -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+    pellucid-server,
+    optparse-applicative,
+    text,
+    time,
+    warp
+
+test-suite pellucid-server-test
+  import:          shared
+  type:            exitcode-stdio-1.0
+  hs-source-dirs:  test
+  main-is:         Main.hs
+  other-modules:
+    Test.Domain
+    Test.Flow
+    Test.Scrub
+    Test.TempPostgres
+  ghc-options:     -threaded
+  build-depends:
+    pellucid-server,
+    aeson,
+    bytestring,
+    containers,
+    directory,
+    filepath,
+    http-types,
+    process,
+    tasty,
+    tasty-hunit,
+    tasty-quickcheck,
+    temporary,
+    text,
+    time,
+    wai,
+    wai-extra
