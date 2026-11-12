@@ -139,3 +139,15 @@ A token, an authorization code and a client secret are 32 random bytes from the 
 ## Licence
 
 AGPL-3.0-or-later. The licence text is not in the repository yet.
+
+
+## 🤝 Contributing
+
+Contributions are welcome. Please feel free to submit a Pull Request.
+
+## Support
+
+
+If you like my style, Cardano ADA donations fund continued work. 
+
+[![Donate ADA](https://img.shields.io/badge/Donate-ADA-0033AD?style=for-the-badge&logo=cardano&logoColor=white)](https://cardanoscan.io/address/addr1qxankwszy6zaclef8vq5fjn3008689yswvangmz604npjhms7402kf0h964awtj8d6xz7lzlvnrq6hz6wu6k845pzkvspum4l7)
