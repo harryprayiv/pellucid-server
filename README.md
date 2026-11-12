@@ -26,7 +26,7 @@ Things that are wrong or missing in what is built are listed in the spec as `Kno
 - **GIF, WebP and MP4 are refused.** Only types with a metadata scrubber are accepted, and only JPEG and PNG have one. There is no video.
 - **No thumbnails.** `preview_url` is the full file.
 - **Nothing runs on a clock.** An upload that is never posted and never taken back stays on disk.
-- **The Pellucid client has not signed in to it yet.** The client accepts the server's nodeinfo name, `pellucid`, and its decoders read this server's answers. It is https only and trusts the public certificate authorities and no others, so it reaches a deployed server with a real certificate and nothing else.
+- **No release build of the Pellucid client can reach it yet.** A development build of the client signs in to a server on the same machine at `http://127.0.0.1:8080` (see Running it locally). A release build is https only and trusts the public certificate authorities and no others, so it needs a deployed server with a real certificate, and none is deployed.
 - **The NixOS module has been evaluated and never run.** Whether the service starts under its systemd restrictions, whether nginx accepts the configuration and whether the certificate is issued have not been seen.
 
 ## Layout
@@ -58,13 +58,13 @@ nix develop
 fish scripts/check.fish
 ```
 
-The gate checks formatting, builds with warnings as errors and runs the tests. `fourmolu.yaml` holds the settings cheeblr's backend uses. The files of the first batch were sent before the formatter had been run, so the gate fails at its first step until this has been run once:
+The gate checks formatting, builds with warnings as errors and runs the tests. `fourmolu.yaml` holds the settings cheeblr's backend uses. When the format check fails after a change, this puts the files into that layout:
 
 ```fish
 nix develop --command fourmolu --mode inplace app src test
 ```
 
-It rewrites 34 of the 39 Haskell files, mostly the indentation of `where` blocks and the layout of import lists. The test suite starts a PostgreSQL of its own in a temporary directory and removes it afterwards, so nothing needs to be running. PostgreSQL does not run as root, so the tests cannot either.
+The test suite starts a PostgreSQL of its own in a temporary directory and removes it afterwards, so nothing needs to be running. PostgreSQL does not run as root, so the tests cannot either.
 
 After changing the dependencies in `pellucid-server.cabal`:
 
@@ -86,11 +86,13 @@ The first command creates a PostgreSQL in `.dev-postgres` that listens on a sock
 curl http://127.0.0.1:8080/api/nodeinfo/2.0.json
 ```
 
-Stop the database with `fish scripts/dev.fish db-stop`. Deleting `.dev-postgres` and `.dev-media` removes every trace.
+To sign in from the Pellucid client, leave `serve` running, start the client from its own repository with `cargo tauri dev`, and type `http://127.0.0.1:8080` into its login screen, scheme included. The consent page opens in the browser and asks for the account's name and password. Only a development build of the client accepts that address, and only with the scheme typed. Screens whose routes are listed under What does not show this server's 404.
+
+Stop the server with Ctrl-C and the database with `fish scripts/dev.fish db-stop`. Deleting `.dev-postgres` and `.dev-media` removes every trace.
 
 ## Deploying
 
-The flake's `nixosModules.default` runs the server on a NixOS machine: the service as its own user on 127.0.0.1, PostgreSQL on the same machine reached over its socket with no password, and nginx in front with a certificate from Let's Encrypt by DNS-01. DNS-01 means the machine does not have to be reachable from outside. Only the DNS record for the name is public, and it can point at a private address. This is how the Pellucid client can be tested against a server at home: the client accepts only https with a certificate from a public authority.
+The flake's `nixosModules.default` runs the server on a NixOS machine: the service as its own user on 127.0.0.1, PostgreSQL on the same machine reached over its socket with no password, and nginx in front with a certificate from Let's Encrypt by DNS-01. DNS-01 means the machine does not have to be reachable from outside. Only the DNS record for the name is public, and it can point at a private address. This is how a release build of the Pellucid client reaches a server at home: outside its development builds the client accepts only https with a certificate from a public authority.
 
 A machine that imports the module sets:
 

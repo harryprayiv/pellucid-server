@@ -109,9 +109,9 @@
 --        cost falls on S1: pixelfed-rn refuses, in its own code, any
 --        server whose nodeinfo name is not pixelfed, so it cannot sign
 --        in here unchanged; and the Pellucid client's check_software
---        refuses this server until it accepts the name (KnownIssue
---        client_refuses_this_server, recorded in both specs). The client
---        API itself stays compatible.
+--        refused this server until 2026-11-11, when it began to accept
+--        the name (KnownIssue client_refuses_this_server, recorded in
+--        both specs). The client API itself stays compatible.
 --   S18. A NEW SCHEMA. The database is this server's own, not Pixelfed's.
 --        An existing Pixelfed instance would come across through an
 --        importer, which is not written.
@@ -209,6 +209,18 @@
 --              timelines, relationships, compose settings, context) was
 --              read by the client's own PureScript decoders and by its
 --              Rust core's structs, with none refused.
+--              Later that day, in the same place, the client itself
+--              against this server at http://127.0.0.1:8080, which a
+--              development build of the client now accepts (the
+--              client's D34). Its core: sign-in through the consent
+--              page, 25 uploads and posts, the home timeline in two
+--              pages by cursor. Its desktop shell, the debug binary on a
+--              display with no screen: sign-in from the login screen,
+--              both feeds with their pictures, a profile, a follow, a
+--              post's own screen. A like, Alerts and Explore drew this
+--              server's 404, as routes that are not built should. A file
+--              was not chosen in the client's composer, so no upload has
+--              come from its webview.
 --
 --   DEPLOY     nix/module.nix, the flake's nixosModules.default:
 --              services.pellucid-server.{enable, package, domain, title,
@@ -726,7 +738,7 @@ default KnownIssue ids_within_one_millisecond = {
 default KnownIssue client_refuses_this_server = {
     name: "the Pellucid client has not signed in to this server",
     status: open,
-    effect: "the client's check_software accepts the name pellucid as of 2026-11-11 (S17), and its decoders and structs read this server's answers. What is left is reach: the client is https only and trusts the public certificate authorities and no others, so it cannot reach a server on a developer's machine, and no server is deployed. Until one is, the server is exercised by its tests and by curl",
+    effect: "the client's check_software accepts the name pellucid (S17), and since 2026-11-11 a development build of the client reaches a server on its own machine over http://127.0.0.1 (the client's D34). That day the client's debug binary signed in to this server and showed feeds, a profile, a follow and a post (status CHECKED). What is left: the same on winsmuth with a real browser and a photo chosen in the composer, and a release build of the client, which is https only, trusts the public certificate authorities and no others, and needs a deployed server, of which there is none",
     closes_when: "a session from the client against a deployed server has signed in, posted a photo and read it back"
 }
 
@@ -745,10 +757,10 @@ default KnownIssue flake_unbuilt = {
 }
 
 default KnownIssue code_unformatted = {
-    name: "the delivered code is not in fourmolu's layout",
-    status: open,
-    effect: "the files of the first batch were sent as written. fourmolu 0.15.0.0, the version the flake provides, rewrites 34 of the 39 with the repository's fourmolu.yaml; the result was built and tested where the work is written, with no warnings and all tests passing. The gate checks formatting from 2026-11-11, so it fails until the formatter has been run once",
-    closes_when: "fourmolu --mode inplace app src test has been run on winsmuth and the gate passes"
+    name: "the delivered code was not in fourmolu's layout",
+    status: closed,
+    effect: "the files of the first batch were sent as written. fourmolu 0.15.0.0, the version the flake provides, rewrote 34 of the 39 with the repository's fourmolu.yaml. The gate checks formatting from 2026-11-11",
+    closes_when: "Closed 2026-11-11: fourmolu --mode inplace app src test was run on winsmuth and the gate passed, its format check included"
 }
 
 ------------------------------------------------------------
