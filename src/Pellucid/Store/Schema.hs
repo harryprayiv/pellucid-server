@@ -14,6 +14,10 @@ Where a spec invariant can be a constraint, it is one:
   * a media row has a post exactly when it is attached
   * an account has a leaving date exactly when it is leaving
   * every lifecycle column accepts only the states its entity declares
+  * a post names the top of its thread exactly when it is a comment
+  * one like and one bookmark per account and post
+  * nobody is notified of what they did themselves
+  * one notification per like and one per follow (decision S20)
 
 Ids come from @next_id()@: milliseconds since 2026-01-01 in the high
 bits and a counter in the low sixteen, so ids sort by creation time,
@@ -33,6 +37,7 @@ import Database.PostgreSQL.Simple.SqlQQ (sql)
 migrations :: [(Int, Text, Query)]
 migrations =
   [ (1, "accounts, oauth, media, posts, follows", initial)
+  , (2, "threads, likes, bookmarks, notifications", interactions)
   ]
 
 initial :: Query
@@ -150,4 +155,57 @@ initial =
       CHECK (follower_id <> target_id)
     );
     CREATE INDEX follows_target ON follows (target_id, status);
+  |]
+
+{- | Comments, likes, bookmarks and notifications. A comment is a post
+that answers another, and @thread_root@ is the post at the top of its
+thread, which is the post the reading rule for a comment asks about. No
+comment existed before this migration, so the new constraint holds for
+every row already there.
+-}
+interactions :: Query
+interactions =
+  [sql|
+    ALTER TABLE posts ADD COLUMN thread_root bigint REFERENCES posts (id);
+    ALTER TABLE posts ADD CONSTRAINT posts_comment_names_its_thread CHECK ((in_reply_to IS NULL) = (thread_root IS NULL));
+    CREATE INDEX posts_replies ON posts (in_reply_to, id) WHERE in_reply_to IS NOT NULL;
+
+    CREATE TABLE likes (
+      id bigint PRIMARY KEY DEFAULT next_id(),
+      account_id bigint NOT NULL REFERENCES accounts (id),
+      post_id bigint NOT NULL REFERENCES posts (id),
+      UNIQUE (account_id, post_id)
+    );
+    CREATE INDEX likes_post ON likes (post_id, id DESC);
+    CREATE INDEX likes_account ON likes (account_id, id DESC);
+
+    CREATE TABLE bookmarks (
+      id bigint PRIMARY KEY DEFAULT next_id(),
+      account_id bigint NOT NULL REFERENCES accounts (id),
+      post_id bigint NOT NULL REFERENCES posts (id),
+      UNIQUE (account_id, post_id)
+    );
+    CREATE INDEX bookmarks_account ON bookmarks (account_id, id DESC);
+    CREATE INDEX bookmarks_post ON bookmarks (post_id);
+
+    CREATE TABLE notifications (
+      id bigint PRIMARY KEY DEFAULT next_id(),
+      recipient_id bigint NOT NULL REFERENCES accounts (id),
+      actor_id bigint REFERENCES accounts (id),
+      kind text NOT NULL
+        CHECK (kind IN ('followed', 'follow_requested', 'mentioned', 'shared', 'liked', 'commented',
+                        'tagged', 'message_received', 'moderation_notice')),
+      post_id bigint REFERENCES posts (id),
+      comment_id bigint REFERENCES posts (id),
+      created_at timestamptz NOT NULL,
+      status text NOT NULL DEFAULT 'unread' CHECK (status IN ('unread', 'seen')),
+      CHECK (actor_id IS NULL OR actor_id <> recipient_id),
+      CHECK (comment_id IS NULL OR kind = 'commented')
+    );
+    CREATE INDEX notifications_recipient ON notifications (recipient_id, id DESC);
+    CREATE INDEX notifications_post ON notifications (post_id);
+    CREATE INDEX notifications_comment ON notifications (comment_id);
+    CREATE UNIQUE INDEX notifications_one_per_like ON notifications (actor_id, post_id) WHERE kind = 'liked';
+    CREATE UNIQUE INDEX notifications_one_per_follow ON notifications (actor_id, recipient_id)
+      WHERE kind IN ('followed', 'follow_requested');
   |]

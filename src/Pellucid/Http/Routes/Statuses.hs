@@ -1,31 +1,36 @@
--- | Posts and the two timelines.
+-- | Posts, comments, threads and the two timelines.
 module Pellucid.Http.Routes.Statuses (
   routes,
   listWindow,
+  Reach (..),
+  visiblePost,
+  readerOf,
 ) where
 
-import Control.Monad (forM_, when)
+import Control.Monad (forM_, unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (throwE)
 import Data.Aeson (Value, object, (.=))
-import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Database.PostgreSQL.Simple (Connection)
-import Network.HTTP.Types (methodDelete, methodGet, methodPost, status200, status403, status501)
+import Network.HTTP.Types (methodDelete, methodGet, methodPost, status200, status403)
 import Network.Wai qualified as Wai
 import Pellucid.Config (Config (..), Env (..), absoluteUrl)
 import Pellucid.Domain.Account (canAct)
 import Pellucid.Domain.Cursor (Cursor (..), Page (..), clampLimit, decodeCursor, paginate)
-import Pellucid.Domain.Ids (MediaId (..), PostId (..), parseId)
+import Pellucid.Domain.Ids (AccountId, MediaId (..), PostId (..), parseId)
+import Pellucid.Domain.Interaction (CommentProblem (..), CommentSubmission (..), checkComment, describeCommentProblem, recipientOf)
 import Pellucid.Domain.Limits (Limits (..))
 import Pellucid.Domain.OAuth (Need (..))
 import Pellucid.Domain.Post (
   Attachment (..),
   MediaStatus (..),
+  PostStatus (..),
   Submission (..),
   Visibility (..),
   canSee,
+  canSeeComment,
   checkPublish,
   describePublishProblem,
   mayWithdraw,
@@ -37,7 +42,19 @@ import Pellucid.Http.Respond (Handler, invalid, json, notFound, pageLink, refuse
 import Pellucid.Http.Router (Access (..), Request (..), Route, Session (..), capture, parse, requireViewer, route)
 import Pellucid.Store (withConnection)
 import Pellucid.Store.Media (MediaRow (..), findMedia, mediaPath)
-import Pellucid.Store.Posts (NewPost (..), PostRow (..), findPost, homeTimeline, insertPost, publicTimeline, withdrawPost)
+import Pellucid.Store.Posts (
+  NewComment (..),
+  NewPost (..),
+  PostRow (..),
+  ancestorsOf,
+  descendantsOf,
+  findPost,
+  homeTimeline,
+  insertComment,
+  insertPost,
+  publicTimeline,
+  withdrawPost,
+ )
 import System.Directory (doesFileExist, removeFile)
 
 routes :: [Route]
@@ -66,10 +83,14 @@ listWindow env request = do
     cursorReader raw = maybe (Left "is not a cursor this server issued") Right (decodeCursor raw)
     idReader raw = maybe (Left "is not an id") Right (parseId raw)
 
+-- | The account a request speaks for, if it carries a token.
+readerOf :: Request -> Maybe AccountId
+readerOf request = fmap (.account) request.viewer
+
 -- | Send a page of posts with the header that leads to the next one.
-sendPage :: Env -> Text -> Int -> Page PostRow -> Connection -> IO Wai.Response
-sendPage env path limit page conn = do
-  entities <- loadStatuses env.config conn page.items
+sendPage :: Env -> Request -> Text -> Int -> Page PostRow -> Connection -> IO Wai.Response
+sendPage env request path limit page conn = do
+  entities <- loadStatuses env.config conn (readerOf request) page.items
   let base = absoluteUrl env.config (path <> "?limit=" <> T.pack (show limit))
   pure (json status200 (pageLink base page.next) (entities :: [Value]))
 
@@ -79,14 +100,14 @@ home env request = do
   (cursor, limit) <- listWindow env request
   liftIO . withConnection env.db $ \conn -> do
     rows <- homeTimeline conn session.account cursor (limit + 1)
-    sendPage env "/api/v1/timelines/home" limit (paginate limit (\row -> let PostId n = row.postId in n) rows) conn
+    sendPage env request "/api/v1/timelines/home" limit (paginate limit (\row -> let PostId n = row.postId in n) rows) conn
 
 public :: Env -> Request -> Handler Wai.Response
 public env request = do
   (cursor, limit) <- listWindow env request
   liftIO . withConnection env.db $ \conn -> do
     rows <- publicTimeline conn cursor (limit + 1)
-    sendPage env "/api/v1/timelines/public" limit (paginate limit (\row -> let PostId n = row.postId in n) rows) conn
+    sendPage env request "/api/v1/timelines/public" limit (paginate limit (\row -> let PostId n = row.postId in n) rows) conn
 
 -- | What a client sends to publish.
 data Draft = Draft
@@ -99,11 +120,12 @@ data Draft = Draft
   , inReplyTo :: Maybe Text
   }
 
--- | Rule PostPublished.
+{- | Rule PostPublished, or rule CommentPublished when the request names
+what it answers.
+-}
 publish :: Env -> Request -> Handler Wai.Response
 publish env request = do
   session <- requireViewer request
-  let limits = env.config.limits
   draft <-
     parse request $
       Draft
@@ -114,8 +136,13 @@ publish env request = do
         <*> withDefault "" "spoiler_text" text
         <*> withDefault False "comments_disabled" bool
         <*> optionalField "in_reply_to_id" text
-  when (isJust draft.inReplyTo) $
-    throwE (refuse status501 "comments_not_built" "comments are not built yet; a post with in_reply_to_id is refused, not published as something else")
+  case draft.inReplyTo of
+    Just parent -> publishComment env session draft parent
+    Nothing -> publishPost env session draft
+
+publishPost :: Env -> Session -> Draft -> Handler Wai.Response
+publishPost env session draft = do
+  let limits = env.config.limits
   visibility <- case draft.visibility of
     Nothing -> pure Public
     Just raw -> maybe (throwE (invalid [FieldProblem "visibility" "is not public, unlisted, private or direct"])) pure (visibilityFromApi raw)
@@ -151,7 +178,7 @@ publish env request = do
           Nothing -> pure (Left [FieldProblem "media_ids" "every attachment must be an upload of yours that is not yet on a post"])
           Just post -> do
             row <- findPost conn post
-            Right <$> loadStatuses env.config conn (maybe [] pure row)
+            Right <$> loadStatuses env.config conn (Just session.account) (maybe [] pure row)
       problems -> pure (Left [FieldProblem field why | (field, why) <- map describePublishProblem problems])
   case result of
     Right (entity : _) -> pure (json status200 [] entity)
@@ -162,11 +189,85 @@ publish env request = do
   where
     unique = foldr (\x seen -> if x `elem` seen then seen else x : seen) []
 
-{- | A post the caller can see (guarantee ReadsObeyTheReadingRules), with
-the connection it was found on. One the caller cannot see is the same
-missing page as one that does not exist.
+{- | Rule CommentPublished. A comment takes its parent's visibility and
+carries no attachment, so a request that names both a parent and an
+upload is refused instead of losing the upload silently. A parent the
+caller cannot read is answered the same way as one that does not exist.
 -}
-visiblePost :: Env -> Request -> (Connection -> PostRow -> IO a) -> Handler a
+publishComment :: Env -> Session -> Draft -> Text -> Handler Wai.Response
+publishComment env session draft rawParent = do
+  parentId <- maybe (throwE (invalid [describe ParentOutOfReach])) (pure . PostId) (parseId rawParent)
+  unless (null draft.mediaIds) $
+    throwE (invalid [FieldProblem "media_ids" "a comment carries no attachment"])
+  now <- liftIO env.clock
+  result <- liftIO . withConnection env.db $ \conn -> do
+    parent <- findPost conn parentId
+    reach <- maybe (pure Reach {post = False, thread = False}) (reachOf conn (Just session)) parent
+    let submission =
+          CommentSubmission
+            { authorStatus = session.accountStatus
+            , parentReadable = reach.post && fmap (.status) parent == Just Published
+            , commentsDisabled = maybe False (.commentsDisabled) parent
+            , text = draft.caption
+            }
+    case (checkComment env.config.limits submission, parent) of
+      ([], Just row) -> do
+        created <-
+          insertComment
+            conn
+            NewComment {author = session.account, text = draft.caption, parent = parentId, publishedAt = now}
+            (recipientOf session.account row.author)
+        case created of
+          Nothing -> pure (Left [ParentOutOfReach])
+          Just comment -> do
+            found <- findPost conn comment
+            Right <$> loadStatuses env.config conn (Just session.account) (maybe [] pure found)
+      ([], Nothing) -> pure (Left [ParentOutOfReach])
+      (problems, _) -> pure (Left problems)
+  case result of
+    Right (entity : _) -> pure (json status200 [] entity)
+    Right [] -> throwE notFound
+    Left problems
+      | CommenterNotActive `elem` problems -> throwE (refuse status403 "account_not_active" "this account cannot comment while it is suspended or leaving")
+      | otherwise -> throwE (invalid (map describe problems))
+  where
+    describe problem = let (field, why) = describeCommentProblem problem in FieldProblem field why
+
+{- | What a caller may read of a post: the post itself, and the thread it
+is in. The two differ for a comment under a post the caller cannot read,
+which its own author still reads.
+-}
+data Reach = Reach
+  { post :: Bool
+  , thread :: Bool
+  }
+
+{- | The reading rules for one post. A post is read under its own
+visibility. For a comment the question is asked of the post at the top
+of its thread.
+-}
+reachOf :: Connection -> Maybe Session -> PostRow -> IO Reach
+reachOf conn viewer row = do
+  toAuthor <- viewerOf conn viewer row.author
+  case row.threadRoot of
+    Nothing -> do
+      let readable = canSee row.status row.visibility toAuthor
+      pure Reach {post = readable, thread = readable}
+    Just top -> do
+      found <- findPost conn top
+      thread <- case found of
+        Nothing -> pure False
+        Just topRow -> do
+          toTop <- viewerOf conn viewer topRow.author
+          pure (canSee topRow.status topRow.visibility toTop)
+      pure Reach {post = canSeeComment row.status toAuthor thread, thread}
+
+{- | A post the caller can see (guarantee ReadsObeyTheReadingRules), with
+the connection it was found on and what the caller may read around it.
+One the caller cannot see is the same missing page as one that does not
+exist.
+-}
+visiblePost :: Env -> Request -> (Connection -> PostRow -> Reach -> IO a) -> Handler a
 visiblePost env request use = do
   raw <- capture 0 request
   wanted <- maybe (throwE notFound) (pure . PostId) (parseId raw)
@@ -174,27 +275,34 @@ visiblePost env request use = do
     row <- findPost conn wanted
     case row of
       Nothing -> pure Nothing
-      Just post -> do
-        viewer <- viewerOf conn request.viewer post.author
-        if canSee post.status post.visibility viewer
-          then Just <$> use conn post
+      Just found -> do
+        reach <- reachOf conn request.viewer found
+        if reach.post
+          then Just <$> use conn found reach
           else pure Nothing
   maybe (throwE notFound) pure found
 
 showStatus :: Env -> Request -> Handler Wai.Response
 showStatus env request = do
-  entities <- visiblePost env request (\conn post -> loadStatuses env.config conn [post])
+  entities <- visiblePost env request (\conn found _ -> loadStatuses env.config conn (readerOf request) [found])
   case entities of
     entity : _ -> pure (json status200 [] entity)
     [] -> throwE notFound
 
-{- | The posts above and below a post in its thread. Comments are not
-built, so both lists are empty, which is also the true answer.
+{- | What a post answers and what answers it. The comments under it come
+oldest first, at any depth, each naming what it answers, and there are
+at most @context_max@ of them. A caller who reads a comment of their
+own under a post they can no longer read is shown their own part of the
+thread and nothing else.
 -}
 context :: Env -> Request -> Handler Wai.Response
 context env request = do
-  () <- visiblePost env request (\_ _ -> pure ())
-  pure (json status200 [] (object ["ancestors" .= ([] :: [Value]), "descendants" .= ([] :: [Value])]))
+  (above, under) <- visiblePost env request \conn found reach -> do
+    let keep = filter (\row -> reach.thread || Just row.author == readerOf request)
+    ancestors <- keep <$> ancestorsOf conn found.postId
+    descendants <- keep <$> descendantsOf conn found.postId env.config.limits.contextMax
+    (,) <$> loadStatuses env.config conn (readerOf request) ancestors <*> loadStatuses env.config conn (readerOf request) descendants
+  pure (json status200 [] (object ["ancestors" .= (above :: [Value]), "descendants" .= (under :: [Value])]))
 
 {- | Rule PostWithdrawn. The answer is the post as it was, which is what
 clients of this API expect from a delete.
@@ -208,7 +316,7 @@ withdraw env request = do
     row <- findPost conn wanted
     case row of
       Just post | mayWithdraw (post.author == session.account) post.status -> do
-        entities <- loadStatuses env.config conn [post]
+        entities <- loadStatuses env.config conn (Just session.account) [post]
         released <- withdrawPost conn wanted session.account
         pure (fmap (entities,) released)
       _ -> pure Nothing

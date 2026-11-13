@@ -11,8 +11,10 @@ import Data.Time (UTCTime (..), addUTCTime, fromGregorian)
 import Pellucid.Domain.Account (AccountStatus (..), accountNext, canAct, canSignIn, isMember)
 import Pellucid.Domain.Cursor (Cursor (..), Page (..), clampLimit, decodeCursor, encodeCursor, paginate)
 import Pellucid.Domain.Follow (FollowOutcome (..), FollowRefusal (..), FollowRequest (..), FollowState (..), decideFollow)
-import Pellucid.Domain.Ids (idText, parseId)
+import Pellucid.Domain.Ids (AccountId (..), idText, parseId)
+import Pellucid.Domain.Interaction
 import Pellucid.Domain.Limits (Limits (..), defaultLimits)
+import Pellucid.Domain.Notification
 import Pellucid.Domain.OAuth
 import Pellucid.Domain.Pkce (Challenge, challengeOf, challengeText, mkChallenge, verifierMatches)
 import Pellucid.Domain.Post
@@ -37,6 +39,9 @@ tests =
     , reading
     , publishing
     , following
+    , marking
+    , commenting
+    , notifications
     , redirects
     ]
 
@@ -270,6 +275,17 @@ reading =
     , testProperty "a withdrawn post is seen by nobody" \a f m ->
         forAll (elements [minBound .. maxBound]) \visibility ->
           canSee Withdrawn visibility Viewer {isAuthor = a, isAcceptedFollower = f, isModerator = m} === False
+    , testCase "a comment is seen by whoever can read the post it is under, and by its author" do
+        canSeeComment Published stranger True @?= True
+        canSeeComment Published stranger False @?= False
+        canSeeComment Published stranger {isAuthor = True} False @?= True
+        -- Following the commenter is not following the author of the post.
+        canSeeComment Published stranger {isAcceptedFollower = True} False @?= False
+    , testCase "a comment that is taken down or withdrawn is read as such a post is" do
+        canSeeComment TakenDown stranger True @?= False
+        canSeeComment TakenDown stranger {isAuthor = True} False @?= True
+        canSeeComment TakenDown stranger {isModerator = True} False @?= True
+        canSeeComment Withdrawn stranger {isAuthor = True, isModerator = True} True @?= False
     , testCase "the API calls followers-only private" do
         visibilityFromApi "private" @?= Just FollowersOnly
         visibilityToApi FollowersOnly @?= "private"
@@ -330,6 +346,72 @@ following =
     ]
   where
     base = FollowRequest {followerStatus = Active, targetStatus = Active, sameAccount = False, targetLocked = False, existing = NoFollow}
+
+-- | Rules PostLiked and PostBookmarked.
+marking :: TestTree
+marking =
+  testGroup
+    "likes and bookmarks"
+    [ testCase "a post that can be read is liked, once" do
+        decideLike base @?= Right Place
+        decideLike base {standing = True} @?= Right AlreadyPlaced
+    , testCase "a post that cannot be read is out of reach, whoever asks and whatever stands" do
+        decideLike base {readable = False} @?= Left PostOutOfReach
+        decideLike base {readable = False, actorStatus = Suspended, standing = True} @?= Left PostOutOfReach
+        decideBookmark base {readable = False, standing = True} @?= Left PostOutOfReach
+    , testCase "a suspended or leaving account cannot like" do
+        map (\status -> decideLike base {actorStatus = status}) [Suspended, Leaving] @?= [Left ActorNotActive, Left ActorNotActive]
+    , testCase "a bookmark asks nothing of the account's standing" do
+        decideBookmark base {actorStatus = Suspended} @?= Right Place
+        decideBookmark base {standing = True} @?= Right AlreadyPlaced
+    , testCase "an author is told of what others do to her post, and never of what she did" do
+        recipientOf (AccountId 1) (AccountId 2) @?= Just (AccountId 2)
+        recipientOf (AccountId 2) (AccountId 2) @?= Nothing
+    ]
+  where
+    base = Mark {actorStatus = Active, readable = True, standing = False}
+
+-- | Rule CommentPublished.
+commenting :: TestTree
+commenting =
+  testGroup
+    "commenting"
+    [ testCase "some text under a post that can be read is a comment" (checkComment defaultLimits base @?= [])
+    , testCase "a comment needs text that is not only blank" do
+        checkComment defaultLimits base {text = ""} @?= [EmptyComment]
+        checkComment defaultLimits base {text = " \n\t "} @?= [EmptyComment]
+    , testCase "a comment has a caption's largest length, counted in characters" do
+        checkComment defaultLimits base {text = T.replicate 500 "é"} @?= []
+        checkComment defaultLimits base {text = T.replicate 501 "é"} @?= [CommentTooLong 500]
+    , testCase "a post can turn comments off" (checkComment defaultLimits base {commentsDisabled = True} @?= [CommentsAreOff])
+    , testCase "a suspended or leaving account cannot comment" do
+        map (\status -> checkComment defaultLimits base {authorStatus = status}) [Suspended, Leaving] @?= [[CommenterNotActive], [CommenterNotActive]]
+    , testCase "every reason is given at once" do
+        checkComment defaultLimits base {authorStatus = Suspended, commentsDisabled = True, text = ""} @?= [CommenterNotActive, CommentsAreOff, EmptyComment]
+    , testCase "a parent that cannot be read is the only reason given, so nothing is said about it" do
+        checkComment defaultLimits base {parentReadable = False, authorStatus = Suspended, commentsDisabled = True, text = ""} @?= [ParentOutOfReach]
+    , testCase "every reason names the field it is about" do
+        map (fst . describeCommentProblem) [ParentOutOfReach, CommenterNotActive, CommentsAreOff, EmptyComment, CommentTooLong 500]
+          @?= ["in_reply_to_id", "account", "in_reply_to_id", "status", "status"]
+    ]
+  where
+    base = CommentSubmission {authorStatus = Active, parentReadable = True, commentsDisabled = False, text = "Lovely light"}
+
+-- | Enum NotificationKind and entity Notification's lifecycle.
+notifications :: TestTree
+notifications =
+  testGroup
+    "notifications"
+    [ testCase "every kind and state has a name the store can read back" do
+        map (parseKind . kindText) [minBound .. maxBound] @?= map Just [minBound .. maxBound]
+        map (parseNotificationStatus . notificationStatusText) [minBound .. maxBound] @?= map Just [minBound .. maxBound]
+    , testCase "what is produced is called what Pixelfed calls it" do
+        map kindToApi [Followed, FollowRequested, Liked, Commented] @?= ["follow", "follow_request", "favourite", "comment"]
+    , testCase "no two kinds share a word" do
+        let names = map kindToApi [minBound .. maxBound]
+        Set.size (Set.fromList names) @?= length names
+    , testCase "a notification is seen once" (map notificationNext [Unread, Seen] @?= [[Seen], []])
+    ]
 
 -- | What rule ClientRegistered accepts as a place to send a code.
 redirects :: TestTree

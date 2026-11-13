@@ -24,7 +24,9 @@ import Pellucid.Http.Respond (Stop, notFound, refuse, safetyHeaders, stopRespons
 import Pellucid.Http.Router (Access (..), Dispatch (..), Request (..), Route (..), Session (..), dispatch)
 import Pellucid.Http.Routes.Accounts qualified as Accounts
 import Pellucid.Http.Routes.Instance qualified as Instance
+import Pellucid.Http.Routes.Interactions qualified as Interactions
 import Pellucid.Http.Routes.Media qualified as Media
+import Pellucid.Http.Routes.Notifications qualified as Notifications
 import Pellucid.Http.Routes.OAuth qualified as OAuth
 import Pellucid.Http.Routes.Statuses qualified as Statuses
 import Pellucid.Secret (hashSecret)
@@ -41,6 +43,8 @@ routeTable limits =
     , Accounts.routes
     , Media.routes limits
     , Statuses.routes
+    , Interactions.routes
+    , Notifications.routes
     ]
 
 application :: Env -> Wai.Application

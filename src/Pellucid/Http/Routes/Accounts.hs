@@ -19,7 +19,7 @@ import Pellucid.Http.Entities (accountJson, loadStatuses, relationshipJson, view
 import Pellucid.Http.Params (BodyLimit (..), listOf, text)
 import Pellucid.Http.Respond (Handler, json, notFound, pageLink, refuse)
 import Pellucid.Http.Router (Access (..), Request (..), Route, Session (..), capture, parse, requireViewer, route)
-import Pellucid.Http.Routes.Statuses (listWindow)
+import Pellucid.Http.Routes.Statuses (listWindow, readerOf)
 import Pellucid.Store (withConnection)
 import Pellucid.Store.Accounts (AccountRow (..), deleteFollow, findAccount, followState, followsBetween, insertFollow)
 import Pellucid.Store.Posts (PostRow (..), accountTimeline)
@@ -57,7 +57,7 @@ accountStatuses env request = do
     viewer <- viewerOf conn request.viewer account.accountId
     rows <- accountTimeline conn account.accountId (viewer.isAuthor || viewer.isAcceptedFollower) cursor (limit + 1)
     let page = paginate limit (\row -> let PostId n = row.postId in n) rows
-    entities <- loadStatuses env.config conn page.items
+    entities <- loadStatuses env.config conn (readerOf request) page.items
     pure (page, entities)
   let
     AccountId n = account.accountId
@@ -72,11 +72,14 @@ relationships env request = do
   rows <- liftIO (withConnection env.db \conn -> followsBetween conn session.account others)
   pure (json status200 [] (map relationshipJson rows))
 
--- | Rules FollowedOpenAccount and FollowRequestedOfLockedAccount.
+{- | Rules FollowedOpenAccount and FollowRequestedOfLockedAccount. The
+target is told once, when the follow is made.
+-}
 follow :: Env -> Request -> Handler Wai.Response
 follow env request = do
   session <- requireViewer request
   target <- capturedAccount env request
+  now <- liftIO env.clock
   outcome <- liftIO . withConnection env.db $ \conn -> do
     standing <- followState conn session.account target.accountId
     let decision =
@@ -89,8 +92,8 @@ follow env request = do
               , existing = standing
               }
     case decision of
-      Right StartFollowing -> insertFollow conn session.account target.accountId Following
-      Right StartRequest -> insertFollow conn session.account target.accountId Requested
+      Right StartFollowing -> insertFollow conn session.account target.accountId Following now
+      Right StartRequest -> insertFollow conn session.account target.accountId Requested now
       _ -> pure ()
     pure decision
   case outcome of

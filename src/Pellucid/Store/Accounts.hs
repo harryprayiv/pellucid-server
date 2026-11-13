@@ -15,7 +15,7 @@ module Pellucid.Store.Accounts (
   followsBetween,
 ) where
 
-import Control.Monad (void)
+import Control.Monad (void, when)
 import Data.Int (Int64)
 import Data.Maybe (listToMaybe)
 import Data.Text (Text)
@@ -26,8 +26,10 @@ import Database.PostgreSQL.Simple.SqlQQ (sql)
 import Pellucid.Domain.Account (AccountStatus, parseAccountStatus)
 import Pellucid.Domain.Follow (FollowState (..), parseFollowState)
 import Pellucid.Domain.Ids (AccountId (..))
+import Pellucid.Domain.Notification (NotificationKind (..))
 import Pellucid.Domain.Username (Username, usernameKey, usernameText)
-import Pellucid.Store (parsed)
+import Pellucid.Store (parsed, transact)
+import Pellucid.Store.Notifications (forgetFollow, notifyFollow)
 
 -- | An account with the three counts every entity that shows it carries.
 data AccountRow = AccountRow
@@ -123,28 +125,39 @@ followState conn (AccountId follower) (AccountId target) = do
   rows <- query conn "SELECT status FROM follows WHERE follower_id = ? AND target_id = ?" (follower, target)
   pure (maybe NoFollow (maybe NoFollow id . parseFollowState . fromOnly) (listToMaybe rows))
 
-{- | Insert a follow in the given state. The primary key makes a second
-insert for the same pair a no-op (invariant OneFollowPerPair).
+{- | Insert a follow in the given state and tell the target, in one
+transaction. The primary key makes a second insert for the same pair a
+no-op (invariant OneFollowPerPair), and then nobody is told again.
 -}
-insertFollow :: Connection -> AccountId -> AccountId -> FollowState -> IO ()
-insertFollow conn (AccountId follower) (AccountId target) state = case state of
+insertFollow :: Connection -> AccountId -> AccountId -> FollowState -> UTCTime -> IO ()
+insertFollow conn follower target state now = case state of
   NoFollow -> pure ()
-  Requested -> go "requested"
-  Following -> go "following"
+  Requested -> go "requested" FollowRequested
+  Following -> go "following" Followed
   where
-    go :: Text -> IO ()
-    go status =
-      void
-        ( execute
-            conn
-            "INSERT INTO follows (follower_id, target_id, status) VALUES (?, ?, ?) ON CONFLICT (follower_id, target_id) DO NOTHING"
-            (follower, target, status)
-        )
+    AccountId followerNumber = follower
+    AccountId targetNumber = target
+    go :: Text -> NotificationKind -> IO ()
+    go status kind = void . transact conn $ do
+      created <-
+        execute
+          conn
+          "INSERT INTO follows (follower_id, target_id, status) VALUES (?, ?, ?) ON CONFLICT (follower_id, target_id) DO NOTHING"
+          (followerNumber, targetNumber, status)
+      when (created == 1) (notifyFollow conn kind follower target now)
+      pure (Right () :: Either () ())
 
--- | Rule Unfollowed. Also how a pending request is withdrawn.
+{- | Rule Unfollowed. Also how a pending request is withdrawn. The notice
+of the follow goes with the follow (decision S20).
+-}
 deleteFollow :: Connection -> AccountId -> AccountId -> IO ()
-deleteFollow conn (AccountId follower) (AccountId target) =
-  void (execute conn "DELETE FROM follows WHERE follower_id = ? AND target_id = ?" (follower, target))
+deleteFollow conn follower target = void . transact conn $ do
+  void (execute conn "DELETE FROM follows WHERE follower_id = ? AND target_id = ?" (followerNumber, targetNumber))
+  forgetFollow conn follower target
+  pure (Right () :: Either () ())
+  where
+    AccountId followerNumber = follower
+    AccountId targetNumber = target
 
 -- | The follows between a viewer and each of the given accounts.
 followsBetween :: Connection -> AccountId -> [AccountId] -> IO [FollowRow]

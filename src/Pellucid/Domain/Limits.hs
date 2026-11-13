@@ -24,6 +24,8 @@ data Limits = Limits
   , unattachedMediaLifetime :: NominalDiffTime
   , listPage :: Int
   , listPageMax :: Int
+  , contextMax :: Int
+  -- ^ How many comments one request for a thread returns.
   }
   deriving stock (Eq, Show)
 
@@ -46,6 +48,7 @@ defaultLimits =
     , unattachedMediaLifetime = 24 * 60 * 60
     , listPage = 20
     , listPageMax = 40
+    , contextMax = 100
     }
 
 maxUploadBytes :: Limits -> Int

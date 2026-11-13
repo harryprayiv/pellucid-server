@@ -41,7 +41,9 @@ library
     Pellucid.Domain.Cursor
     Pellucid.Domain.Follow
     Pellucid.Domain.Ids
+    Pellucid.Domain.Interaction
     Pellucid.Domain.Limits
+    Pellucid.Domain.Notification
     Pellucid.Domain.OAuth
     Pellucid.Domain.Pkce
     Pellucid.Domain.Post
@@ -55,13 +57,17 @@ library
     Pellucid.Http.Router
     Pellucid.Http.Routes.Accounts
     Pellucid.Http.Routes.Instance
+    Pellucid.Http.Routes.Interactions
     Pellucid.Http.Routes.Media
+    Pellucid.Http.Routes.Notifications
     Pellucid.Http.Routes.OAuth
     Pellucid.Http.Routes.Statuses
     Pellucid.Secret
     Pellucid.Store
     Pellucid.Store.Accounts
+    Pellucid.Store.Interactions
     Pellucid.Store.Media
+    Pellucid.Store.Notifications
     Pellucid.Store.OAuth
     Pellucid.Store.Posts
     Pellucid.Store.Schema

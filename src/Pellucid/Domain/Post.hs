@@ -18,6 +18,7 @@ module Pellucid.Domain.Post (
   Viewer (..),
   stranger,
   canSee,
+  canSeeComment,
   Attachment (..),
   Submission (..),
   PublishProblem (..),
@@ -144,6 +145,18 @@ canSee status visibility viewer = case status of
     Unlisted -> True
     FollowersOnly -> viewer.isAuthor || viewer.isAcceptedFollower
     Direct -> viewer.isAuthor
+
+{- | The reading rule for a comment. It is read by whoever can read the
+post it is under, which the caller has worked out with 'canSee' for the
+post at the top of the thread, and by its own author. The viewer here is
+what the reader is to the comment's author. A comment a moderator has
+taken down is read as a taken-down post is.
+-}
+canSeeComment :: PostStatus -> Viewer -> Bool -> Bool
+canSeeComment status viewer threadReadable = case status of
+  Withdrawn -> False
+  TakenDown -> viewer.isAuthor || viewer.isModerator
+  Published -> viewer.isAuthor || threadReadable
 
 -- | One of the uploads a submission names, as the store finds it.
 data Attachment = Attachment

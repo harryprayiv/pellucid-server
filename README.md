@@ -2,12 +2,13 @@
 
 The server for Pellucid: a photo-sharing server that speaks the client API Pixelfed's apps speak, written in Haskell on WAI and Warp with PostgreSQL. The client lives in the `pellucid` repository. What the server is meant to do is in `.inference/pellucid-server.allium`, which is checked by `allium check` and updated with every change to the code.
 
-This is the first batch. It is one slice through the whole stack, tested end to end. It must not be put on the internet yet, for the reasons under What does not.
+It is a slice through the whole stack, tested end to end, and it grows a batch at a time. It must not be put on the internet yet, for the reasons under What does not.
 
 ## What works
 
-A person can sign in, post a photo and read it back.
+A person can sign in, post a photo, read it back, like, bookmark and comment on posts, and read their notifications.
 
+- The server's own address (`GET /`) shows a page that says the server is running, that it has no website, and which address to give the app.
 - An app registers itself (`POST /api/v1/apps`), as a confidential client with a secret or, with `token_endpoint_auth_method=none`, as a public client that must use PKCE.
 - The person signs in on a page the server draws and allows the app (`/oauth/authorize`). The app exchanges the code for a token (`/oauth/token`) and can give the token back (`/oauth/revoke`).
 - Uploads (`POST /api/v2/media`) are JPEG or PNG. Before a byte is stored the file is stripped of everything that is not the picture: EXIF with its position and device, the embedded thumbnail, XMP, IPTC, comments, and anything after the end of the image. A JPEG keeps its orientation and nothing else. The file is never decoded, so the picture is the uploader's own bit for bit.
@@ -15,10 +16,13 @@ A person can sign in, post a photo and read it back.
 - The home timeline is the person's own posts and those of the accounts they follow, newest first, with nothing inserted. The public timeline is the public posts of local accounts. Every list pages by an opaque cursor in a `Link` header.
 - Following and unfollowing, relationships, an account and its posts.
 - A followers-only post is readable by its author and by accepted followers. For anyone else it is a 404, the same as a post that does not exist.
+- Likes (`POST /api/v1/statuses/{id}/favourite`, `/unfavourite`) and bookmarks (`/bookmark`, `/unbookmark`), each answered with the post as it then is. A post's entity counts its likes and names the latest liker; whether it is liked or bookmarked is told to the reader about the reader's own like and bookmark only. `GET /api/v1/favourites` and `/api/v1/bookmarks` list what the account can still read, newest first, and `GET /api/v1/statuses/{id}/favourited_by` lists who likes a post, to anyone who can read the post.
+- Comments: `POST /api/v1/statuses` with `in_reply_to_id` and no upload. A comment takes the visibility of the post it is under and is read by whoever can read that post, and by its own author. A comment can answer a comment. `GET /api/v1/statuses/{id}/context` returns what a post answers and the comments under it at any depth, oldest first, up to 100. Comments are in no timeline and are not counted among an account's posts. A post can turn comments off.
+- Notifications (`GET /api/v1/notifications`) of a follow, a like and a comment, with the words Pixelfed uses for them. Nobody is told of what they did themselves. A notification is removed when what it reports is: an unlike, an unfollow, a deleted comment or a deleted post. Reading a page marks its notifications seen.
 
 ## What does not
 
-Comments, likes, shares, bookmarks, hashtags, notifications, direct messages, blocks and mutes, edits, reports and moderation, export, account deletion, federation. None of it is built. A request to post a comment is answered with 501 and is not published as something else.
+Shares, hashtags, mentions, search and discovery, direct messages, blocks and mutes, edits to a post or a profile, follow requests for a locked account, reports and moderation, export, account deletion, federation. None of it is built, and a client that calls one of those routes is answered 404. A caption is not read for names or hashtags, so nobody is notified of a mention and a post's `mentions` and `tags` are empty.
 
 Things that are wrong or missing in what is built are listed in the spec as `KnownIssue` entries. The ones that matter most:
 
@@ -45,7 +49,7 @@ scripts/check.fish                  the gate
 scripts/dev.fish                    a local database and server
 ```
 
-Each rule in the spec that is built has a function in `src/Pellucid/Domain` named for it in a comment: `authorize` is rule AuthorizationGranted, `redeem` is TokenIssued, `checkPublish` is PostPublished, `canSee` is the reading rule, `decideFollow` is the two follow rules, `scrub` is MediaProcessingStarted. The functions take facts and return a decision. They touch no database and no clock, which is what lets the tests cover them case by case. The store carries a decision out inside one transaction.
+Each rule in the spec that is built has a function in `src/Pellucid/Domain` named for it in a comment: `authorize` is rule AuthorizationGranted, `redeem` is TokenIssued, `checkPublish` is PostPublished, `checkComment` is CommentPublished, `decideLike` and `decideBookmark` are PostLiked and PostBookmarked, `canSee` and `canSeeComment` are the reading rule, `decideFollow` is the two follow rules, `scrub` is MediaProcessingStarted. The functions take facts and return a decision. They touch no database and no clock, which is what lets the tests cover them case by case. The store carries a decision out inside one transaction.
 
 Routes are a table of values, not types. Pixelfed's own clients send the same field in a query string, a form, a multipart body or JSON depending on the client and the route, so every request's inputs are merged into one set of named values and a route describes what it needs with an applicative parser over that set. A request with three bad fields is answered with all three.
 
@@ -86,7 +90,9 @@ The first command creates a PostgreSQL in `.dev-postgres` that listens on a sock
 curl http://127.0.0.1:8080/api/nodeinfo/2.0.json
 ```
 
-To sign in from the Pellucid client, leave `serve` running, start the client from its own repository with `cargo tauri dev`, and type `http://127.0.0.1:8080` into its login screen, scheme included. The consent page opens in the browser and asks for the account's name and password. Only a development build of the client accepts that address, and only with the scheme typed. Screens whose routes are listed under What does not show this server's 404.
+To sign in from the Pellucid client, leave `serve` running and start the client from its own repository with `cargo tauri dev`. In the client's own window, type `http://127.0.0.1:8080` into the Server field, scheme included, and press Sign in. The client then opens the sign-in page in the browser by itself, and that page asks for the account's name and password. Opening `http://127.0.0.1:8080` in a browser by hand does not sign anyone in: it shows a page that says the server is running, because the sign-in form is made from the request the client sends. Only a development build of the client accepts that address, and only with the scheme typed. Screens whose routes are listed under What does not show this server's 404.
+
+A change to the code that brings a new migration is applied by starting `serve` again, which says so in its first lines. The accounts and posts already in `.dev-postgres` stay.
 
 Stop the server with Ctrl-C and the database with `fish scripts/dev.fish db-stop`. Deleting `.dev-postgres` and `.dev-media` removes every trace.
 
@@ -141,15 +147,3 @@ A token, an authorization code and a client secret are 32 random bytes from the 
 ## Licence
 
 AGPL-3.0-or-later. The licence text is not in the repository yet.
-
-
-## 🤝 Contributing
-
-Contributions are welcome. Please feel free to submit a Pull Request.
-
-## Support
-
-
-If you like my style, Cardano ADA donations fund continued work. 
-
-[![Donate ADA](https://img.shields.io/badge/Donate-ADA-0033AD?style=for-the-badge&logo=cardano&logoColor=white)](https://cardanoscan.io/address/addr1qxankwszy6zaclef8vq5fjn3008689yswvangmz604npjhms7402kf0h964awtj8d6xz7lzlvnrq6hz6wu6k845pzkvspum4l7)

@@ -1,5 +1,5 @@
-{- | The JSON this server sends for an account, an attachment, a post and a
-relationship. The shapes are the ones the Pixelfed client API uses
+{- | The JSON this server sends for an account, an attachment, a post, a
+relationship and a notification. The shapes are the ones the Pixelfed client API uses
 (contract ClientApiCompat), and there is one of each: every route that
 returns a post returns this one (invariant SameEntityEverywhere).
 
@@ -13,6 +13,7 @@ module Pellucid.Http.Entities (
   statusJson,
   relationshipJson,
   loadStatuses,
+  loadNotifications,
   viewerOf,
 ) where
 
@@ -24,12 +25,15 @@ import Database.PostgreSQL.Simple (Connection)
 import Pellucid.Config (Config, absoluteUrl)
 import Pellucid.Domain.Follow (FollowState (..))
 import Pellucid.Domain.Ids (AccountId (..), MediaId (..), PostId (..), idText)
+import Pellucid.Domain.Notification (kindToApi)
 import Pellucid.Domain.Post (Viewer (..), visibilityToApi)
 import Pellucid.Http.Respond (escapeHtml, timestamp)
 import Pellucid.Http.Router (Session (..))
 import Pellucid.Store.Accounts (AccountRow (..), FollowRow (..), findAccounts, followState)
+import Pellucid.Store.Interactions (Marks (..), marksOf)
 import Pellucid.Store.Media (MediaRow (..), mediaOfPosts)
-import Pellucid.Store.Posts (PostRow (..))
+import Pellucid.Store.Notifications (NotificationRow (..))
+import Pellucid.Store.Posts (PostRow (..), postsReadableBy)
 
 accountJson :: Config -> AccountRow -> Value
 accountJson config row =
@@ -99,9 +103,12 @@ mediaJson config row =
               ]
       _ -> Null
 
--- | A post with its author and its attachments.
-statusJson :: Config -> AccountRow -> [MediaRow] -> PostRow -> Value
-statusJson config author media row =
+{- | A post with its author, its attachments, and what is known of its
+likes and of the reader's own like and bookmark. A comment is a post
+with no attachment that names what it answers.
+-}
+statusJson :: Config -> AccountRow -> [MediaRow] -> Maybe Marks -> PostRow -> Value
+statusJson config author media marks row =
   object
     [ "id" .= idText postNumber
     , "uri" .= url
@@ -116,20 +123,26 @@ statusJson config author media row =
     , "spoiler_text" .= row.spoilerText
     , "pf_type" .= kind
     , "media_attachments" .= map (mediaJson config) media
-    , "favourites_count" .= (0 :: Int)
+    , "favourites_count" .= likes
     , "reblogs_count" .= (0 :: Int)
     , "reply_count" .= row.replyCount
-    , "favourited" .= False
+    , "favourited" .= maybe False (.likedByReader) marks
     , "reblogged" .= False
-    , "bookmarked" .= False
+    , "bookmarked" .= maybe False (.bookmarkedByReader) marks
     , "comments_disabled" .= row.commentsDisabled
     , "in_reply_to_id" .= fmap (\(PostId parent) -> idText parent) row.inReplyTo
-    , "in_reply_to_account_id" .= Null
+    , "in_reply_to_account_id" .= fmap (\(AccountId parent) -> idText parent) row.parentAuthor
     , "reblog" .= Null
     , "tags" .= ([] :: [Value])
     , "mentions" .= ([] :: [Value])
     , "emojis" .= ([] :: [Value])
-    , "liked_by" .= object ["username" .= Null, "others" .= False]
+    , "liked_by"
+        .= object
+          [ "id" .= fmap (\(AccountId liker, _) -> idText liker) latest
+          , "username" .= fmap snd latest
+          , "others" .= (likes > 1)
+          , "total_count" .= likes
+          ]
     , "place" .= Null
     , "local" .= (author.home == Nothing)
     , "pinned" .= False
@@ -137,6 +150,8 @@ statusJson config author media row =
   where
     PostId postNumber = row.postId
     url = absoluteUrl config ("/p/" <> author.username <> "/" <> idText postNumber)
+    likes = maybe 0 (.likes) marks
+    latest = marks >>= (.latestLiker)
     kind :: Text
     kind = case (row.inReplyTo, length media) of
       (Just _, _) -> "text"
@@ -171,24 +186,56 @@ relationshipJson row =
   where
     AccountId otherNumber = row.other
 
-{- | The entities for a page of posts, in the page's order, with their
-authors and attachments fetched in two queries for the whole page.
+{- | The entities for a page of posts, in the page's order, as one reader
+gets them. Authors, attachments, and likes and bookmarks are fetched in
+three queries for the whole page.
 -}
-loadStatuses :: Config -> Connection -> [PostRow] -> IO [Value]
-loadStatuses config conn rows = do
+loadStatuses :: Config -> Connection -> Maybe AccountId -> [PostRow] -> IO [Value]
+loadStatuses config conn reader rows = map snd <$> loadStatusPairs config conn reader rows
+
+loadStatusPairs :: Config -> Connection -> Maybe AccountId -> [PostRow] -> IO [(PostId, Value)]
+loadStatusPairs config conn reader rows = do
   authors <- findAccounts conn (unique [row.author | row <- rows])
   media <- mediaOfPosts conn [row.postId | row <- rows]
+  marks <- marksOf conn reader [row.postId | row <- rows]
   pure
     ( mapMaybe
         ( \row -> do
             author <- lookupBy (.accountId) row.author authors
-            pure (statusJson config author [m | m <- media, m.post == Just row.postId] row)
+            pure (row.postId, statusJson config author [m | m <- media, m.post == Just row.postId] (lookupBy (.post) row.postId marks) row)
         )
         rows
     )
+
+{- | The entities for a page of notifications, as their recipient gets
+them. The @status@ beside a like is the post that was liked; beside a
+comment it is the comment itself, which names the post it answers. A
+post the recipient can no longer read is left out and the notification
+is sent without it (guarantee ReadsObeyTheReadingRules).
+-}
+loadNotifications :: Config -> Connection -> AccountId -> [NotificationRow] -> IO [Value]
+loadNotifications config conn recipient rows = do
+  actors <- findAccounts conn (unique (mapMaybe (.actor) rows))
+  posts <- postsReadableBy conn recipient (unique (mapMaybe shown rows))
+  statuses <- loadStatusPairs config conn (Just recipient) posts
+  pure
+    [ object
+      [ "id" .= idText row.notificationId
+      , "type" .= kindToApi row.kind
+      , "created_at" .= timestamp row.createdAt
+      , "account" .= fmap (accountJson config) (row.actor >>= \actor -> lookupBy (.accountId) actor actors)
+      , "status" .= (shown row >>= \post -> lookup post statuses)
+      ]
+    | row <- rows
+    ]
   where
-    unique = foldr (\x seen -> if x `elem` seen then seen else x : seen) []
-    lookupBy key wanted = foldr (\candidate found -> if key candidate == wanted then Just candidate else found) Nothing
+    shown row = maybe row.post Just row.comment
+
+unique :: (Eq a) => [a] -> [a]
+unique = foldr (\x seen -> if x `elem` seen then seen else x : seen) []
+
+lookupBy :: (Eq key) => (a -> key) -> key -> [a] -> Maybe a
+lookupBy key wanted = foldr (\candidate found -> if key candidate == wanted then Just candidate else found) Nothing
 
 -- | What a caller is to a post by the given author (for @can_see@).
 viewerOf :: Connection -> Maybe Session -> AccountId -> IO Viewer

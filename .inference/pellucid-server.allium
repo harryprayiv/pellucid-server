@@ -32,8 +32,10 @@
 -- check. They are the author of this file's reading of that phrase, not
 -- instructions received, and each one that is wrong should be struck.
 -- S3's choice of language and S17 to S19 were taken by the same author on
--- 2026-11-10, while writing the first code, and are proposals in the same
--- sense: the code follows them, and striking one means changing code.
+-- 2026-11-10, while writing the first code, and S20 to S22 on 2026-11-12,
+-- while writing likes, comments and notifications. They are proposals in
+-- the same sense: the code follows them, and striking one means changing
+-- code.
 --
 --   S1. PROTOCOL COMPATIBLE. The client API is the one pixelfed-rn and
 --       Pellucid already speak (the Mastodon-shaped API with Pixelfed's
@@ -124,9 +126,34 @@
 --        stranger sent. A type that cannot be scrubbed this way is
 --        refused. Thumbnails will need a decoder and are an open question
 --        below.
+--   S20. A NOTIFICATION LASTS AS LONG AS WHAT IT REPORTS. Taking back a
+--        like removes the notice of it, unfollowing removes the notice
+--        of the follow, deleting a comment removes the notice of it, and
+--        deleting a post removes every notice about it. Nobody is told
+--        of something that is no longer so, and liking and unliking in a
+--        loop leaves one notice at most. Reading a page of notifications
+--        is what marks them seen: the client API has no call for it.
+--   S21. WHO LIKES A POST CAN BE READ BY WHOEVER CAN READ THE POST: the
+--        whole list, paged the same way for every reader. Pixelfed gives
+--        the list to the post's author and its first page to everyone
+--        else. The post's entity names the latest liker to every reader
+--        in both servers, so a like was never private, and a list that
+--        stops after one page for some readers hides nothing.
+--   S22. A COMMENT BELONGS TO THE THREAD OF ONE POST. It takes that
+--        post's visibility and is read by whoever can read that post,
+--        and by its own author. A comment can answer a comment, and the
+--        thread is still the post's. Following a commenter opens no way
+--        into a thread under someone else's followers-only post.
+--        Deleting a post or a comment leaves what answered it in place,
+--        as the posts of the people who wrote them. What answered a
+--        deleted comment stays in the thread, which is where its author
+--        can find it to delete it. What was under a deleted post is read
+--        by its own author and by nobody else.
 --
--- IMPLEMENTATION STATUS at 2026-11-11: the first batch of code, of
--- 2026-11-10, and the deployment module that followed it. The code is in
+-- IMPLEMENTATION STATUS at 2026-11-12: the first batch of code, of
+-- 2026-11-10, the deployment module that followed it, the page at the
+-- server's own address, and likes, bookmarks, comments and
+-- notifications. The code is in
 -- this repository: Haskell (GHC2021), WAI and Warp, PostgreSQL through
 -- postgresql-simple. The decision of each rule is a pure function under
 -- src/Pellucid/Domain, named for the rule it carries out; the store
@@ -136,24 +163,30 @@
 --   BUILT      Rules ClientRegistered, AuthorizationGranted, TokenIssued,
 --              TokenRevoked, MediaTakenBack, MediaAttached, MediaReleased,
 --              PostPublished, PostWithdrawn, FollowedOpenAccount,
---              FollowRequestedOfLockedAccount and Unfollowed. Rules
---              CodeExpired and TokenExpired as a check made when a code
---              or a token is used. Invariants OneFollowPerPair,
---              NobodyFollowsThemselves and PublicClientsHoldNoSecret as
---              database constraints; PublicClientsAlwaysUsePkce,
---              AttachedMediaBelongsToItsPostsAuthor and the first half of
+--              FollowRequestedOfLockedAccount and Unfollowed. Since
+--              2026-11-12 rules CommentPublished, PostLiked, PostUnliked,
+--              PostBookmarked, PostUnbookmarked and NotificationSeen.
+--              Rules CodeExpired and TokenExpired as a check made when a
+--              code or a token is used. Invariants OneFollowPerPair,
+--              NobodyFollowsThemselves, PublicClientsHoldNoSecret,
+--              OneLikePerAccountAndPost, CommentsNameTheirThread,
+--              NobodyIsToldOfTheirOwnAct, OneNoticePerLike and
+--              OneNoticePerFollow as database constraints, with one
+--              bookmark per account and post beside them;
+--              PublicClientsAlwaysUsePkce,
+--              AttachedMediaBelongsToItsPostsAuthor and
 --              PostsHaveMediaAndCommentsNeedNone in the rules' decisions.
 --              Contract ClientApiCompat's invariants SameEntityEverywhere
 --              and ErrorsSayWhy for the routes that exist, and
 --              OneWayToPage with max_id translated to a cursor; min_id and
 --              page are accepted and ignored.
---              The reading rules can_see, home timeline and public
---              timeline, without blocks, mutes, hashtags and limit_reach,
---              none of which exists yet. Surface SignIn's guarantee
---              SecretsAreNeverReturnedTwice. Decisions S12 and S13 for
---              what exists; of S11, public clients and a token given back
---              by its holder, not the list of a person's sessions; and
---              S17 to S19.
+--              The reading rules can_see, for posts and for comments,
+--              home timeline and public timeline, without blocks, mutes,
+--              hashtags and limit_reach, none of which exists yet.
+--              Surface SignIn's guarantee SecretsAreNeverReturnedTwice.
+--              Decisions S12 and S13 for what exists; of S11, public
+--              clients and a token given back by its holder, not the list
+--              of a person's sessions; and S17 to S22.
 --   PARTIAL    Rules MediaReceived, MediaProcessingStarted and
 --              MediaProcessed run inside the upload request: the file is
 --              scrubbed, then written, then its row is written once, as
@@ -166,18 +199,23 @@
 --              and there is no route for it. Rules FollowRequestAccepted
 --              and FollowRequestRejected have no route, and no route can
 --              lock an account, so a follow request can be made only by
---              a test of the decision. The notifications and the
---              FederationQueued that several built rules also ensure are
---              not produced.
+--              a test of the decision. The notices of a follow, a follow
+--              request, a like and a comment are produced. A mention is
+--              not: a caption is not read for names or for hashtags, and
+--              a post's mentions and tags are sent empty. The
+--              FederationQueued that several built rules also ensure is
+--              not produced. The rules that would consult a block do not,
+--              because no block can exist yet.
 --   NOT BUILT  Everything else: the remaining account rules,
---              UnattachedMediaCollected, comments, edits, likes, shares,
---              bookmarks, blocks, mutes, hashtags, notifications, direct
---              messages, reports, moderation, appeals, federation,
---              export, and surfaces ModerationDesk, PublicRecord,
---              Federation and Workers. A request to publish a comment is
---              answered 501 and is not published as something else.
+--              UnattachedMediaCollected, edits, shares, blocks, mutes,
+--              hashtags, direct messages, reports, moderation, appeals,
+--              federation, export, and surfaces ModerationDesk,
+--              PublicRecord, Federation and Workers. No rule that is
+--              built makes a notification of kind mentioned, shared,
+--              tagged, message_received or moderation_notice.
 --
---   ROUTES     GET /.well-known/nodeinfo, /api/nodeinfo/2.0.json,
+--   ROUTES     GET / (a page for a person, surface SignIn).
+--              GET /.well-known/nodeinfo, /api/nodeinfo/2.0.json,
 --              /api/v1/instance, /api/v1.1/compose/settings.
 --              POST /api/v1/apps. GET and POST /oauth/authorize.
 --              POST /oauth/token, /oauth/revoke.
@@ -189,6 +227,12 @@
 --              POST /api/v1/statuses. GET and DELETE
 --              /api/v1/statuses/{id}. GET /api/v1/statuses/{id}/context.
 --              GET /api/v1/timelines/home, /public.
+--              Since 2026-11-12: POST /api/v1/statuses with
+--              in_reply_to_id (a comment). POST
+--              /api/v1/statuses/{id}/favourite, /unfavourite, /bookmark,
+--              /unbookmark. GET /api/v1/statuses/{id}/favourited_by.
+--              GET /api/v1/favourites, /api/v1/bookmarks,
+--              /api/v1/notifications.
 --
 --   CHECKED    74 tests: the rules' decisions as unit and property tests;
 --              the scrubber against files built segment by segment; and
@@ -221,6 +265,31 @@
 --              server's 404, as routes that are not built should. A file
 --              was not chosen in the client's composer, so no upload has
 --              come from its webview.
+--              2026-11-12: GET / is a step of the end-to-end session (a
+--              page, the address in it, nothing that can run) and was
+--              read from the running server; a path with no route still
+--              answers 404 and POST / answers 405. Still 74 tests.
+--              Later that day, 93 tests. The end-to-end session likes,
+--              bookmarks, comments, answers a comment, reads both
+--              threads and the notifications of two accounts, tries the
+--              reading rules as a third account that follows nobody, and
+--              deletes a comment and a liked post;
+--              the decisions of the new rules have unit tests. Twelve
+--              deliberate breaks of the new code were tried and eleven
+--              were noticed. The twelfth, telling an author of the same
+--              like twice, cannot happen while the index
+--              notifications_one_per_like stands. A deleted post's likes
+--              and bookmarks are removed and no test can see whether
+--              they are, because nothing reads them afterwards. The
+--              migration was applied to the database of the day before,
+--              with its posts and follows, which read as before and
+--              could be liked. Where the work is written, the client's
+--              desktop shell against this server: a like, a bookmark and
+--              a comment made in the app, the list of who likes a post,
+--              and Alerts showing a follow, a comment and a like, with
+--              the comment's notice opening its post. On winsmuth the
+--              same day, as reported from there, the client signed in to
+--              this server at http://127.0.0.1:8080.
 --
 --   DEPLOY     nix/module.nix, the flake's nixosModules.default:
 --              services.pellucid-server.{enable, package, domain, title,
@@ -458,6 +527,8 @@ entity Post {
     spoiler_text: String
     comments_disabled: Boolean
     in_reply_to: Post?
+    -- For a comment, the post at the top of its thread (S22).
+    thread_top: Post?
     published_at: Timestamp
     edit_count: Integer
     status: published | withdrawn | taken_down
@@ -465,7 +536,10 @@ entity Post {
     media: Media with post = this
     likes: Like with post = this
     shares: Share with post = this
+    bookmarks: Bookmark with post = this
     replies: Post with in_reply_to = this
+    notices: Notification with post = this
+    notices_of_it: Notification with comment = this
 
     transitions status {
         published -> withdrawn
@@ -531,7 +605,11 @@ entity Notification {
     recipient: Account
     actor: Account?
     kind: NotificationKind
+    -- The post the notification is about: the one liked or commented on.
     post: Post?
+    -- The comment itself, when the notification reports one. It is what
+    -- the client API sends beside the notification, as Pixelfed does.
+    comment: Post?
     created_at: Timestamp
     status: unread | seen
 
@@ -688,6 +766,8 @@ config {
     delivery_first_backoff: Duration = 1.minute
     list_page: Integer = 20
     list_page_max: Integer = 40
+    -- How many comments one request for a thread returns, oldest first.
+    context_max: Integer = 100
     -- The longest side of a picture, in pixels. The server does not
     -- decode an upload, but every client that shows it will.
     max_image_side: Integer = 16384
@@ -738,7 +818,7 @@ default KnownIssue ids_within_one_millisecond = {
 default KnownIssue client_refuses_this_server = {
     name: "the Pellucid client has not signed in to this server",
     status: open,
-    effect: "the client's check_software accepts the name pellucid (S17), and since 2026-11-11 a development build of the client reaches a server on its own machine over http://127.0.0.1 (the client's D34). That day the client's debug binary signed in to this server and showed feeds, a profile, a follow and a post (status CHECKED). What is left: the same on winsmuth with a real browser and a photo chosen in the composer, and a release build of the client, which is https only, trusts the public certificate authorities and no others, and needs a deployed server, of which there is none",
+    effect: "the client's check_software accepts the name pellucid (S17), and since 2026-11-11 a development build of the client reaches a server on its own machine over http://127.0.0.1 (the client's D34). On 2026-11-12 the client signed in to this server on winsmuth, as reported from there. What is left: whether a photo chosen in the client's composer on winsmuth reaches this server has not been reported, and a release build of the client, which is https only, trusts the public certificate authorities and no others, needs a deployed server, of which there is none",
     closes_when: "a session from the client against a deployed server has signed in, posted a photo and read it back"
 }
 
@@ -1020,10 +1100,18 @@ rule CommentPublished {
     requires: not exists Block{blocker: parent.author, blocked: author}
     requires: trimmed(text) != "" and length_of(text) <= config.max_caption_length
     ensures:
-        Post.created(author: author, caption: text, visibility: parent.visibility, sensitive: false, spoiler_text: "", comments_disabled: false, in_reply_to: parent, published_at: now, edit_count: 0, status: published)
+        let comment = Post.created(author: author, caption: text, visibility: parent.visibility, sensitive: false, spoiler_text: "", comments_disabled: false, in_reply_to: parent, thread_top: top_of(parent), published_at: now, edit_count: 0, status: published)
         if parent.author != author:
-            Notification.created(recipient: parent.author, actor: author, kind: commented, post: parent, created_at: now, status: unread)
+            Notification.created(recipient: parent.author, actor: author, kind: commented, post: parent, comment: comment, created_at: now, status: unread)
         FederationQueued(kind: create, from: author)
+
+    @guidance
+        -- top_of(p) is p for a post and p.thread_top for a comment. A
+        -- comment carries no attachment: a request that names both a
+        -- parent and an upload is refused, not published without the
+        -- upload. A parent the author cannot read is answered exactly as
+        -- one that does not exist. The one told is the author of what is
+        -- answered, which for an answer to a comment is the commenter.
 }
 
 rule PostEdited {
@@ -1062,12 +1150,19 @@ rule PostWithdrawn {
             not exists like
         for share in post.shares:
             not exists share
+        for bookmark in post.bookmarks:
+            not exists bookmark
+        for notice in post.notices:
+            not exists notice
+        for notice in post.notices_of_it:
+            not exists notice
         FederationQueued(kind: delete, from: author)
 
     @guidance
         -- The author can always delete, including a post a moderator has
-        -- taken down. Comments under a deleted post stay, as their
-        -- authors' posts, and lose their parent.
+        -- taken down. This is also how a comment is deleted. What
+        -- answered a deleted post or comment stays, as the posts of the
+        -- people who wrote them (S22), and its notices go (S20).
 }
 
 rule PostTakenDown {
@@ -1109,10 +1204,16 @@ rule PostLiked {
 rule PostUnliked {
     when: UnlikeSubmitted(account, post)
     let like = Like{account: account, post: post}
+    let notice = Notification{actor: account, post: post, kind: liked}
     requires: exists like
     ensures:
         not exists like
+        not exists notice
         FederationQueued(kind: undo, from: account)
+
+    @guidance
+        -- S20. Taking back a like that is not there changes nothing and
+        -- is answered with the post, as liking twice is.
 }
 
 rule PostShared {
@@ -1207,13 +1308,18 @@ rule FollowRequestRejected {
 rule Unfollowed {
     when: UnfollowSubmitted(follower, target)
     let follow = Follow{follower: follower, target: target}
+    let notice = Notification{recipient: target, actor: follower, kind: followed}
+    let request_notice = Notification{recipient: target, actor: follower, kind: follow_requested}
     requires: exists follow
     ensures:
         not exists follow
+        not exists notice
+        not exists request_notice
         FederationQueued(kind: undo, from: follower)
 
     @guidance
-        -- Also how a pending request is withdrawn.
+        -- Also how a pending request is withdrawn. The notice of the
+        -- follow goes with it (S20).
 }
 
 rule AccountBlocked {
@@ -1283,6 +1389,12 @@ rule NotificationSeen {
     requires: notification.recipient = recipient
     requires: notification.status = unread
     ensures: notification.status = seen
+
+    @guidance
+        -- Raised for every notification on a page when the page is read
+        -- (S20). The post sent beside a notification obeys the reading
+        -- rules: one the recipient can no longer read is left out and
+        -- the notification is sent without it.
 }
 
 -- Direct messages --------------------------------------------------------
@@ -1539,6 +1651,28 @@ invariant OneLikePerAccountAndPost {
             a != b implies a.account != b.account or a.post != b.post
 }
 
+invariant CommentsNameTheirThread {
+    for p in Posts:
+        p.is_comment = (p.thread_top != null)
+}
+
+invariant NobodyIsToldOfTheirOwnAct {
+    for n in Notifications:
+        n.actor != n.recipient
+}
+
+invariant OneNoticePerLike {
+    for a in Notifications:
+        for b in Notifications:
+            a != b and a.kind = liked and b.kind = liked implies a.actor != b.actor or a.post != b.post
+}
+
+invariant OneNoticePerFollow {
+    for a in Notifications:
+        for b in Notifications:
+            a != b and (a.kind = followed or a.kind = follow_requested) and (b.kind = followed or b.kind = follow_requested) implies a.actor != b.actor or a.recipient != b.recipient
+}
+
 invariant OneShareOfPublicPostsOnly {
     for s in Shares:
         s.post.visibility = public
@@ -1621,7 +1755,20 @@ invariant DepartedAccountsHoldNothing {
 --                           is its author or an accepted follower; and
 --                           neither of viewer and author blocks the
 --                           other. A taken_down post is seen by its
---                           author and by moderators only.
+--                           author and by moderators only. A published
+--                           comment is seen by its author and by whoever
+--                           can see the post at the top of its thread
+--                           (S22); the comment's own author's followers
+--                           have no part in it.
+--   a thread                what a post answers, from the top down, and
+--                           the published comments under it at any
+--                           depth, oldest first, config.context_max of
+--                           them at most. A reader who sees a comment of
+--                           their own under a post they can no longer
+--                           see is shown their own part and no more.
+--   the lists of likes      an account's likes and its bookmarks, newest
+--   and bookmarks           first by when each was placed, hold only what
+--                           the account can still see.
 --   home timeline           the viewer's own published posts, and
 --                           those of accounts the viewer follows and of
 --                           hashtags the viewer follows that the viewer
@@ -1678,6 +1825,16 @@ surface SignIn {
     @guarantee SecretsAreNeverReturnedTwice
         -- A client secret is shown at registration and stored hashed; a
         -- password is never stored or logged in a form that can be read.
+
+    @guarantee TheFrontAddressAnswersAPerson
+        -- GET / is a page that says the server is running, that it has
+        -- no website, and which address to give the app, in the form the
+        -- app takes it. It asks for nothing and reads nothing from the
+        -- database. Until 2026-11-12 the address answered the
+        -- missing-page error, and on winsmuth that day a person who
+        -- opened it in a browser took the server for broken. The sign-in
+        -- form is reached only through the link the app opens, because
+        -- the form is made from the app's authorization request.
 }
 
 -- The client API with a token (contract ClientApiCompat).
@@ -1924,6 +2081,8 @@ deferred Collections.lifecycle         -- see: not written; Pixelfed's /api/v1.1
 
 open question "Whether decisions S5 to S16 are what less authoritarian means. They are a reading of the phrase, written down so it can be corrected; each one that is wrong should be struck before any code depends on it."
 open question "How previews and blurhashes are made under S19. A smaller rendition needs the picture decoded, and a decoder is the largest attack surface a media server has. The candidates are a decoder in a separate process with no network, no filesystem and a memory limit, or accepting full-size previews and making none."
+open question "Whether S20 to S22 are right. S21 in particular makes a choice Pixelfed did not: everyone who can read a post can page through everyone who likes it."
+open question "Whether a post's reply_count should count its whole thread. It counts direct answers, as the entity says, so a post whose only comment was deleted shows 0 while its thread still holds what answered that comment."
 open question "What a suspension does to the posts the account already made. The rules say what a suspended account cannot do and nothing about whether its posts stay in timelines and on its profile. The code follows the rules as written: they stay."
 open question "How sign-in attempts are limited (KnownIssue no_sign_in_throttle) without turning the limit into a way to lock a person out of their own account by guessing at it."
 open question "Whether the client API should stay Pixelfed-compatible indefinitely or only until Pellucid's own client is the main one. Compatibility is S1; it also fixes the entity shapes, the four historical pagination parameters and the _pe flag in place."
